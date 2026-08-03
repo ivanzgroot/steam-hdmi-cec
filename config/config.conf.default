@@ -1,0 +1,48 @@
+# /etc/cec-hdmi/config.conf
+#
+# Plain KEY=VALUE. Sourced by cec-hook.sh (bash) and parsed by
+# cec-controller-watch.py (no shell expansion there - keep values literal).
+# Re-running install.sh never overwrites this file; the shipped defaults are
+# always mirrored to config.conf.default so you can diff after an upgrade.
+#
+# After editing:  sudo systemctl restart cec-hdmi-controller.service
+
+# Ignore further Home-button presses for this many seconds after one fires.
+# Also covers the duplicate events you get when Steam mirrors a physical pad
+# onto a virtual uinput device. Fractional values are fine.
+COOLDOWN_SECONDS=2.5
+
+# Which button counts as "Home". Space- or comma-separated evdev key names, or
+# raw numeric codes. A device is watched if it advertises at least one of these.
+#   BTN_MODE      (316) Guide/Home/PS/Xbox button on almost every gamepad
+#   BTN_HOME            not defined by mainline Linux input-event-codes.h; kept
+#                       here for kernels/controllers that do define it, and
+#                       harmlessly ignored (with a one-line note) when they do not
+#   KEY_HOMEPAGE  (172) used by some Bluetooth pads that expose Home on a
+#                       separate keyboard-ish input node
+# Run "sudo /etc/cec-hdmi/cec-controller-watch.py --monitor" and press your
+# button to find out what your controller actually sends.
+BUTTON_CODES="BTN_MODE BTN_HOME KEY_HOMEPAGE"
+
+# 1 = only watch devices that look like gamepads (advertise BTN_GAMEPAD/0x130).
+# Default 0, because some controllers report Home on a separate non-gamepad node
+# that would otherwise be skipped.
+GAMEPAD_ONLY=0
+
+# 1 = log "would trigger" instead of actually running cec-hook.sh. Lets you test
+# button detection with no TV/CEC hardware involved.
+DRY_RUN=0
+
+# Safety-net rescan interval (seconds) for hotplugged controllers. Hotplug is
+# normally instant via the kernel netlink uevent socket; this only backstops it.
+RESCAN_SECONDS=5
+
+# Desktop notifications (best effort; they generally show in Desktop Mode and
+# not inside gamescope). 1 = on, 0 = off.
+NOTIFY_ON_TRIGGER=0
+NOTIFY_ON_FAILURE=1
+
+# Log size cap. Each log is rotated to .1 .. .N once it reaches LOG_MAX_BYTES.
+# Set LOG_MAX_BYTES=0 to disable rotation entirely.
+LOG_MAX_BYTES=1048576
+LOG_KEEP=2

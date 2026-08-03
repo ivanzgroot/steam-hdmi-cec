@@ -1,0 +1,17 @@
+[Unit]
+Description=HDMI-CEC: wake TV after resuming from suspend/hibernate
+After=systemd-suspend.service
+After=systemd-hibernate.service
+After=systemd-hybrid-sleep.service
+After=systemd-suspend-then-hibernate.service
+
+[Service]
+Type=oneshot
+ExecStart=/etc/cec-hdmi/cec-hook.sh on
+TimeoutStartSec=150
+
+[Install]
+WantedBy=systemd-suspend.service
+WantedBy=systemd-hibernate.service
+WantedBy=systemd-hybrid-sleep.service
+WantedBy=systemd-suspend-then-hibernate.service

@@ -58,8 +58,9 @@ sudo bash install.sh                    # install or update
 sudo bash install.sh status             # services, DPCD state, controllers, recent logs
 sudo bash install.sh uninstall          # remove services and units
 sudo bash install.sh uninstall --purge  # ...and delete /etc/cec-hdmi entirely
+bash install.sh selftest                # run the test suite (no root, changes nothing)
 bash install.sh --help                  # full usage
-bash install.sh --version               # script version + installed version
+bash install.sh --version               # repo version + installed version
 ```
 
 Test the CEC path by hand at any time:
@@ -76,6 +77,22 @@ Inspect controller detection:
 sudo /etc/cec-hdmi/cec-controller-watch.py --detect    # what is watched, and why
 sudo /etc/cec-hdmi/cec-controller-watch.py --monitor   # live key events
 sudo /etc/cec-hdmi/cec-controller-watch.py --dry-run   # run without touching the TV
+```
+
+## Repo layout
+
+`install.sh` is a plain installer: it copies the files that live next to it. It
+is **not** self-contained, so running a lone `install.sh` downloaded on its own
+will tell you what is missing rather than half-installing.
+
+```
+install.sh                        the installer (shell only)
+VERSION                           single source of truth for the version
+src/cec-hook.sh                   all CEC logic (on / off / dpcd-status)
+src/cec-controller-watch.py       the controller watcher daemon
+config/config.conf.default        shipped defaults
+systemd/*.service                 the four unit files
+tests/                            test suite, run by `install.sh selftest`
 ```
 
 ## What gets installed
@@ -236,3 +253,35 @@ Button presses are logged as `DRY RUN - would run` and the TV is never touched.
 sudo bash install.sh uninstall           # keeps /etc/cec-hdmi (config + logs)
 sudo bash install.sh uninstall --purge   # removes it too
 ```
+
+## Development
+
+```sh
+bash install.sh selftest      # or: bash tests/run.sh
+bash tests/run.sh -v          # verbose
+```
+
+No root, no install, nothing outside a temp directory is touched. The suite
+stubs the handful of Linux-only calls the daemon makes, so **it runs anywhere
+python3 does** — you can validate a change on a laptop before pushing it to the
+SteamOS box.
+
+| Suite | Covers |
+| --- | --- |
+| `test_config.py` | config parsing, sysfs bitmask decoding, key-name resolution, log rotation |
+| `test_watcher.py` | debounce state machine, raw `input_event` decoding, device selection, disconnects |
+| `test_hotplug.py` | netlink uevent parsing (add / remove / malformed) |
+| `test_detect.py` | device enumeration and `--detect`, against a fake sysfs tree |
+| `test_packaging.py` | version sync, installer copies every shipped file, units match `SERVICES`, shipped defaults match the code's defaults |
+
+The suite exists because this layer fails *quietly*. A misparsed capability
+bitmask does not crash — the daemon starts, reports itself healthy, and silently
+decides your controller has no Home button. The kernel writes those bitmaps with
+`%lx` per `long`, **unpadded**, so word size must come from `sizeof(long)` and
+never from how long the hex words look; getting that wrong shifts every button
+number. `test_config.py` pins it.
+
+`test_packaging.py` covers the failure mode introduced by splitting the payload
+into separate files: a file that exists in the repo but that `install.sh` never
+copies, or a unit that never gets enabled. Neither would fail loudly at install
+time.

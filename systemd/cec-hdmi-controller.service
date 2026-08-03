@@ -1,0 +1,16 @@
+[Unit]
+Description=HDMI-CEC: wake TV when a controller Home/Guide button is pressed
+Documentation=file:/etc/cec-hdmi/config.conf
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/etc/cec-hdmi/cec-controller-watch.py
+Restart=on-failure
+RestartSec=3
+# Root, like every other unit here: /dev/input/event* is root:input 0660 and the
+# wake path writes DPCD registers over /dev/drm_dp_auxN.
+User=root
+
+[Install]
+WantedBy=multi-user.target
