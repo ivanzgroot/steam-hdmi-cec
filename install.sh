@@ -71,8 +71,8 @@ What gets installed
           sudo $WATCH_SCRIPT --monitor   print key events live (find your button)
 
   $CONFIG_FILE
-      The cec-ctl wake/standby command lists, cooldown, trigger button codes,
-      dry-run, notifications, log caps.
+      The cec-ctl wake/standby/audio command lists, cooldown, trigger button
+      codes, dry-run, notifications, log caps.
       Written with defaults on first install and NEVER overwritten afterwards;
       current defaults are always mirrored to $CONFIG_DEFAULTS for reference.
       Edit it, then: sudo systemctl restart cec-hdmi-controller.service

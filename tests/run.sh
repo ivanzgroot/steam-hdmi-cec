@@ -74,7 +74,8 @@ run "src/cec-controller-watch.py compiles" "$PYTHON" -c \
 run "config.conf.default is sourceable" \
     bash -c 'set -u; . "$1"
              [ -n "${COOLDOWN_SECONDS}${BUTTON_CODES}${LOG_MAX_BYTES}" ] &&
-             [ -n "${CEC_WAKE_COMMANDS}${CEC_STANDBY_COMMANDS}${CEC_COMMAND_DELAY}" ]' \
+             [ -n "${CEC_WAKE_COMMANDS}${CEC_STANDBY_COMMANDS}${CEC_COMMAND_DELAY}" ] &&
+             [ -n "${CEC_AUDIO_COMMANDS}" ]' \
     _ "$REPO_ROOT/config/config.conf.default"
 
 echo

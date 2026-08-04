@@ -123,7 +123,8 @@ for line in (defaults_block.group(1).splitlines() if defaults_block else []):
 
 check("hook declares the CEC command keys",
       sorted(k for k in hook_defaults if k.startswith("CEC_")),
-      ["CEC_COMMAND_DELAY", "CEC_STANDBY_COMMANDS", "CEC_WAKE_COMMANDS"])
+      ["CEC_AUDIO_COMMANDS", "CEC_COMMAND_DELAY", "CEC_STANDBY_COMMANDS",
+       "CEC_WAKE_COMMANDS"])
 for key, expected in sorted(hook_defaults.items()):
     check("%s matches cec-hook.sh's fallback" % key, values.get(key), expected)
 
@@ -145,6 +146,9 @@ check("wake sends the configured list, not a hardcoded chain",
       'run_cec_commands "$CEC_WAKE_COMMANDS"' in hook, True)
 check("standby sends the configured list",
       'run_cec_commands "$CEC_STANDBY_COMMANDS"' in hook, True)
+check("the audio/AVR request runs only after a wake the TV acknowledged",
+      re.search(r'log "Wake sequence sent OK[^\n]*\n\s*wake_audio_system', hook) is not None,
+      True)
 
 with open(os.path.join(REPO_ROOT, "src", "cec-controller-watch.py"), errors="replace") as fh:
     daemon = fh.read()

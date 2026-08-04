@@ -134,6 +134,7 @@ the file on every wake and standby, so the CEC command keys apply immediately.
 | --- | --- | --- |
 | `CEC_WAKE_COMMANDS` | see below | The `cec-ctl` calls that wake the TV. |
 | `CEC_STANDBY_COMMANDS` | `"--to 0 --standby"` | The `cec-ctl` calls sent on suspend, shutdown and reboot. |
+| `CEC_AUDIO_COMMANDS` | see below | Sent after a successful wake to power up an AVR. Best effort — never fails a wake. Set to `""` to disable. |
 | `CEC_COMMAND_DELAY` | `1` | Seconds between the commands of a list. `0` sends them without a pause. |
 | `COOLDOWN_SECONDS` | `2.5` | Ignore further Home presses for this long after one fires. Fractions allowed. |
 | `BUTTON_CODES` | `"BTN_MODE BTN_HOME KEY_HOMEPAGE"` | Which codes count as Home. Names or numbers, space- or comma-separated. |
@@ -178,6 +179,44 @@ Two things to keep: `-v`, because the retry logic decides whether the TV
 acknowledged by looking for `Not Acknowledged` in `cec-ctl`'s verbose output,
 and at least one command in each list — an empty list is reported as an error
 rather than counted as a successful wake.
+
+### AVRs and audio systems
+
+A TV waking up does not wake the receiver in front of it, so once the TV has
+acknowledged, `CEC_AUDIO_COMMANDS` asks the audio system to turn on and take
+over audio. Logical address `5` is the audio system, and the request carries our
+physical address, which is what tells the AVR which input to select:
+
+```sh
+CEC_AUDIO_COMMANDS="-v -s --to 5 --system-audio-mode-request=phys-addr={phys_addr}"
+```
+
+This one is deliberately **best effort**: it runs after the wake, and neither a
+NACK nor a failure can turn a wake the TV already acknowledged into a failed
+one. That is also why it is a separate key rather than two more entries in
+`CEC_WAKE_COMMANDS` — with no AVR on the bus, address `5` never answers, and
+`Not Acknowledged` inside the wake output would send every AVR-less install
+through the full retry escalation and report a failure for a TV that is visibly
+on. Instead you get one line per wake:
+
+```
+NOTE: no audio system answered on logical address 5 (expected if you have no AVR)
+```
+
+Set `CEC_AUDIO_COMMANDS=""` to stop sending it. If your AVR ignores the request,
+run `cec-ctl -s -M` and press its power button to see the address and messages it
+actually uses; some prefer a plain keypress:
+
+```sh
+CEC_AUDIO_COMMANDS="-v -s --to 5 --user-control-pressed=ui-cmd=power-on-function"
+```
+
+Standby stays symmetric only if you ask for it — to send the AVR to sleep along
+with the TV:
+
+```sh
+CEC_STANDBY_COMMANDS="--to 0 --standby; --to 5 --standby"
+```
 
 Test an edit immediately, no restart or suspend cycle needed:
 

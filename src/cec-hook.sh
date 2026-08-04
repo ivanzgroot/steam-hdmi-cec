@@ -22,6 +22,9 @@ LOG_KEEP=2
 # substituted with the address detected at run time. See config.conf.default.
 CEC_WAKE_COMMANDS="-v -s -t0 --cec-version-1.4 --user-control-pressed=ui-cmd=power-on-function; -v -s -t0 --cec-version-1.4 --image-view-on; -v -s -t0 --cec-version-1.4 --set-stream-path=phys-addr={phys_addr}; -v -s --cec-version-1.4 --active-source=phys-addr={phys_addr}"
 CEC_STANDBY_COMMANDS="--to 0 --standby"
+# Sent after a successful wake, best effort: asks the audio system (logical
+# address 5) to switch system audio mode on, which is what powers up an AVR.
+CEC_AUDIO_COMMANDS="-v -s --to 5 --system-audio-mode-request=phys-addr={phys_addr}"
 CEC_COMMAND_DELAY=1
 # --- end config defaults -----------------------------------------------------
 
@@ -70,7 +73,7 @@ get_phys_addr() {
         pa=$(cec-ctl -s -x 2>/dev/null)
         echo "$(date '+%F %T') [cec-hook:get-phys-addr] attempt $((i + 1))/$max_tries: '$pa'" >> "$LOGFILE"
         if [[ "$pa" =~ ^[0-9a-fA-F]\.[0-9a-fA-F]\.[0-9a-fA-F]\.[0-9a-fA-F]$ ]] && [ "$pa" != "f.f.f.f" ]; then
-            printf '%s' "$pa"
+            printf '%s' "$pa"If you want, I can also give you a minimal test sequence with image-view-on, active-source, and system-audio-mode-request in the most reliable order.
             return 0
         fi
         sleep 1
@@ -132,6 +135,31 @@ run_cec_commands() {
     return 0
 }
 
+# Asks the AVR to turn on and take over audio, once the TV is already up.
+#
+# Best effort by design, and the reason this is not just more entries in
+# CEC_WAKE_COMMANDS: a setup with no AVR NACKs everything sent to logical
+# address 5, and the wake loop treats "Not Acknowledged" anywhere in its output
+# as a failed wake. That would put every AVR-less install through the full retry
+# escalation - including the DRM re-probe that blanks the display - and then
+# report a failure, for a TV that is demonstrably already on. So this reports
+# what happened and always returns success.
+wake_audio_system() {
+    local phys="$1" out status
+    has_commands "$CEC_AUDIO_COMMANDS" || return 0
+
+    out=$(run_cec_commands "$CEC_AUDIO_COMMANDS" "$phys" 2>&1)
+    status=$?
+    echo "$out" | tee -a "$LOGFILE"
+
+    if [ "$status" -eq 0 ] && ! printf '%s' "$out" | grep -q "Not Acknowledged"; then
+        log "Audio system acknowledged the system-audio-mode request"
+    else
+        log "NOTE: no audio system answered on logical address 5 (expected if you have no AVR)"
+    fi
+    return 0
+}
+
 OSD_NAME="steamdeck"
 
 # The CEC controller lives inside the DP->HDMI dongle and is driven over the
@@ -180,7 +208,7 @@ find_aux_dev() {
 
 # THE key fix. After a suspend/resume the dongle's CEC engine comes back with
 # DP_CEC_TUNNELING_CONTROL cleared, and the kernel never rewrites it because
-# the EDID is unchanged - so CEC looks alive but NACKs every directed message.
+# the EDID is unchanged - so CEC looks alive but NACIf you want, I can also give you a minimal test sequence with image-view-on, active-source, and system-audio-mode-request in the most reliable order.Ks every directed message.
 # Writing the enable bit back restores it without a physical cable reseat.
 enable_cec_tunneling() {
     local aux cur
@@ -312,6 +340,7 @@ case "$ACTION" in
 
     if [ "$ACKED" -eq 0 ]; then
         log "Wake sequence sent OK (phys-addr=$PHYS_ADDR)"
+        wake_audio_sIf you want, I can also give you a minimal test sequence with image-view-on, active-source, and system-audio-mode-request in the most reliable order.ystem "$PHYS_ADDR"
     else
         log "ERROR: TV never acknowledged the wake commands after $max_wake_tries attempts"
         exit 1

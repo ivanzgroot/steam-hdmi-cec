@@ -41,21 +41,28 @@ def hook_default(key):
     return value
 
 
-FUNCTIONS = extract("has_commands") + "\n\n" + extract("run_cec_commands")
+FUNCTIONS = "\n\n".join(
+    extract(name) for name in ("has_commands", "run_cec_commands", "wake_audio_system"))
 
 # cec-ctl and sleep become shell functions, so the real ones are never reached
 # and every invocation is recorded in order. FAIL_ON makes the Nth cec-ctl exit
-# non-zero, which is how the stop-at-first-failure behaviour gets tested.
+# non-zero, which is how the stop-at-first-failure behaviour gets tested, and
+# CECCTL_NOTE fakes the "Not Acknowledged" line a real cec-ctl -v prints when
+# nothing answers - the failure mode that matters for a missing AVR, because
+# cec-ctl still exits 0 for it.
 PREAMBLE = """
 set -uo pipefail
 CALLS=0
 cec-ctl() {
     CALLS=$((CALLS + 1))
     echo "CALL $*"
+    [ -n "${CECCTL_NOTE:-}" ] && echo "$CECCTL_NOTE"
     [ "$CALLS" = "${FAIL_ON:-0}" ] && return 3
     return 0
 }
 sleep() { echo "SLEEP $1"; }
+log() { echo "LOG $*"; }
+LOGFILE=/dev/null
 """
 
 
@@ -72,6 +79,23 @@ def run(list_value, phys="", delay=None, fail_on=None):
         "\n",
         "\n".join(env),
         "\nrun_cec_commands %s %s\n" % (shell_quote(list_value), shell_quote(phys)),
+        'echo "STATUS $?"\n',
+    ])
+    done = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    return done.stdout.strip().splitlines()
+
+
+def run_audio(list_value=None, phys="3.0.0.0", note=None, fail=False):
+    """Run wake_audio_system with CEC_AUDIO_COMMANDS set to list_value."""
+    if list_value is None:
+        list_value = hook_default("CEC_AUDIO_COMMANDS")
+    script = "".join([
+        PREAMBLE,
+        FUNCTIONS,
+        "\nCEC_AUDIO_COMMANDS=%s\n" % shell_quote(list_value),
+        "CECCTL_NOTE=%s\n" % shell_quote(note or ""),
+        "FAIL_ON=%d\n" % (1 if fail else 0),
+        "wake_audio_system %s\n" % shell_quote(phys),
         'echo "STATUS $?"\n',
     ])
     done = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
@@ -112,6 +136,28 @@ check("default standby list sends one directed standby",
       ["CALL --to 0 --standby", "STATUS 0"])
 check("verbose stays on (the NACK check greps cec-ctl's output)",
       "-v" in hook_default("CEC_WAKE_COMMANDS").split(), True)
+
+check.section("audio system / AVR wake")
+check("default audio list asks address 5 for system audio mode",
+      run_audio(),
+      ["CALL -v -s --to 5 --system-audio-mode-request=phys-addr=3.0.0.0",
+       "LOG Audio system acknowledged the system-audio-mode request",
+       "STATUS 0"])
+# The three ways "there is no AVR" shows up, none of which may fail a wake that
+# the TV already acknowledged.
+check("a NACK is reported but never fails the wake",
+      run_audio(note="Not Acknowledged"),
+      ["CALL -v -s --to 5 --system-audio-mode-request=phys-addr=3.0.0.0",
+       "Not Acknowledged",
+       "LOG NOTE: no audio system answered on logical address 5 "
+       "(expected if you have no AVR)",
+       "STATUS 0"])
+check("a failing cec-ctl never fails the wake either",
+      run_audio(fail=True)[-1], "STATUS 0")
+check("an empty audio list sends nothing and succeeds",
+      run_audio(list_value=""), ["STATUS 0"])
+check("audio commands are a separate key, not part of the wake list",
+      "--to 5" in hook_default("CEC_WAKE_COMMANDS"), False)
 
 check.section("list splitting")
 check("single command, no delay before it",

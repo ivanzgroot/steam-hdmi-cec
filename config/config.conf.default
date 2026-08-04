@@ -33,7 +33,23 @@ CEC_WAKE_COMMANDS="-v -s -t0 --cec-version-1.4 --user-control-pressed=ui-cmd=pow
 
 # Sent on suspend, shutdown and reboot. Some setups prefer broadcasting standby
 # to everything on the bus: CEC_STANDBY_COMMANDS="--to 15 --standby"
+# To send the AVR to standby along with the TV, add it as a second command:
+#   CEC_STANDBY_COMMANDS="--to 0 --standby; --to 5 --standby"
 CEC_STANDBY_COMMANDS="--to 0 --standby"
+
+# Audio system / AVR, sent once the TV has acknowledged the wake. "--to 5" is
+# the audio system's logical address, and a System Audio Mode Request carrying
+# our physical address is what makes an AVR power on and switch to this input.
+#
+# This list is best effort: unlike the wake commands, nothing here can fail a
+# wake. With no AVR on the bus, logical address 5 simply does not answer and the
+# log gets one "no audio system answered" line per wake - set the key to ""
+# to stop sending it at all.
+#
+# If your AVR ignores this, run "cec-ctl -s -M" while pressing its power button
+# to see what address it actually uses and which messages it accepts; some want
+# a plain "--to 5 --user-control-pressed=ui-cmd=power-on-function" instead.
+CEC_AUDIO_COMMANDS="-v -s --to 5 --system-audio-mode-request=phys-addr={phys_addr}"
 
 # Seconds to wait between the commands of a list. A TV that has just powered on
 # can drop messages that arrive back to back; 0 sends them without a pause.
