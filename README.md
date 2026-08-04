@@ -127,10 +127,14 @@ sudo systemctl restart cec-hdmi-controller.service
 ```
 
 Plain `KEY=VALUE`, sourceable by bash and parsed by the daemon without any
-dependencies.
+dependencies. Only the controller keys need that restart — `cec-hook.sh` re-reads
+the file on every wake and standby, so the CEC command keys apply immediately.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
+| `CEC_WAKE_COMMANDS` | see below | The `cec-ctl` calls that wake the TV. |
+| `CEC_STANDBY_COMMANDS` | `"--to 0 --standby"` | The `cec-ctl` calls sent on suspend, shutdown and reboot. |
+| `CEC_COMMAND_DELAY` | `1` | Seconds between the commands of a list. `0` sends them without a pause. |
 | `COOLDOWN_SECONDS` | `2.5` | Ignore further Home presses for this long after one fires. Fractions allowed. |
 | `BUTTON_CODES` | `"BTN_MODE BTN_HOME KEY_HOMEPAGE"` | Which codes count as Home. Names or numbers, space- or comma-separated. |
 | `GAMEPAD_ONLY` | `0` | `1` = only watch devices that advertise `BTN_GAMEPAD`. |
@@ -140,6 +144,52 @@ dependencies.
 | `NOTIFY_ON_FAILURE` | `1` | Desktop notification when a wake fails. |
 | `LOG_MAX_BYTES` | `1048576` | Rotate each log at this size. `0` disables rotation. |
 | `LOG_KEEP` | `2` | How many rotated logs to keep. |
+
+### Changing what gets sent over CEC
+
+TVs disagree about which CEC messages they honour, so the wake and standby
+sequences live in the config rather than inside `cec-hook.sh`. Both keys hold a
+semicolon-separated list of `cec-ctl` argument sets: each entry is one `cec-ctl`
+invocation, run in order, `CEC_COMMAND_DELAY` seconds apart, and the sequence
+stops at the first command that fails.
+
+`{phys_addr}` is replaced with this PC's HDMI physical address (`3.0.0.0` or
+similar), re-detected on every run so it survives a port or cable change.
+
+The default wake sequence — a remote-control "power on" keypress, the standard
+CEC wake, "switch to my HDMI port", then "I am the active source":
+
+```sh
+CEC_WAKE_COMMANDS="-v -s -t0 --cec-version-1.4 --user-control-pressed=ui-cmd=power-on-function; -v -s -t0 --cec-version-1.4 --image-view-on; -v -s -t0 --cec-version-1.4 --set-stream-path=phys-addr={phys_addr}; -v -s --cec-version-1.4 --active-source=phys-addr={phys_addr}"
+```
+
+Some worked examples:
+
+```sh
+# TV that only needs the standard wake, and wants a longer gap between messages
+CEC_WAKE_COMMANDS="-v -s -t0 --image-view-on; -v -s --active-source=phys-addr={phys_addr}"
+CEC_COMMAND_DELAY=2
+
+# Put everything on the bus into standby, not just the TV (15 = broadcast)
+CEC_STANDBY_COMMANDS="--to 15 --standby"
+```
+
+Two things to keep: `-v`, because the retry logic decides whether the TV
+acknowledged by looking for `Not Acknowledged` in `cec-ctl`'s verbose output,
+and at least one command in each list — an empty list is reported as an error
+rather than counted as a successful wake.
+
+Test an edit immediately, no restart or suspend cycle needed:
+
+```sh
+sudo bash /etc/cec-hdmi/cec-hook.sh off
+sudo bash /etc/cec-hdmi/cec-hook.sh on
+tail -f /etc/cec-hdmi/cec-hook.log
+```
+
+Everything around the sequence — physical-address detection, the DPCD `0x3001`
+re-enable, the NACK retry escalation — is unchanged and still owned by
+`cec-hook.sh`. Only the messages themselves are yours to pick.
 
 ### Changing the trigger button
 
@@ -272,6 +322,7 @@ SteamOS box.
 | `test_watcher.py` | debounce state machine, raw `input_event` decoding, device selection, disconnects |
 | `test_hotplug.py` | netlink uevent parsing (add / remove / malformed) |
 | `test_detect.py` | device enumeration and `--detect`, against a fake sysfs tree |
+| `test_hook.py` | `cec-hook.sh`'s command runner: list splitting, `{phys_addr}`, delays, stop-at-first-failure, and that the shipped wake sequence is still the documented four messages |
 | `test_packaging.py` | version sync, installer copies every shipped file, units match `SERVICES`, shipped defaults match the code's defaults |
 
 The suite exists because this layer fails *quietly*. A misparsed capability

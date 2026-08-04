@@ -30,7 +30,7 @@ import struct
 import sys
 import time
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 CEC_DIR = "/etc/cec-hdmi"
 DEFAULT_CONFIG = os.path.join(CEC_DIR, "config.conf")

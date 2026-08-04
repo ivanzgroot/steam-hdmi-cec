@@ -99,15 +99,40 @@ check("config.conf.default parses cleanly", problems, [])
 for key, expected in sorted(w.DEFAULTS.items()):
     check("%s matches DEFAULTS" % key, values.get(key), expected)
 
-declared_keys = set(re.findall(r"^([A-Z][A-Z0-9_]*)=", open(CONFIG_SRC).read(), re.M))
-check("config ships no key the daemon ignores",
-      sorted(declared_keys - set(w.DEFAULTS)), [])
-check("config ships every key the daemon knows",
-      sorted(set(w.DEFAULTS) - declared_keys), [])
-
-check.section("payload scripts are runnable as installed")
+# The other half of the config is owned by cec-hook.sh, which carries its own
+# fallbacks for the case where config.conf is missing or predates a key. Those
+# live in a marked block so they can be read back and compared here - a hook
+# default that silently disagrees with the shipped config means the same
+# install behaves differently depending on how old its config.conf is.
 with open(HOOK_SRC, errors="replace") as fh:
     hook = fh.read()
+
+defaults_block = re.search(
+    r"^# --- config defaults.*?$\n(.*?)^# --- end config defaults", hook, re.S | re.M)
+check("cec-hook.sh has a marked config-defaults block", defaults_block is not None, True)
+
+hook_defaults = {}
+for line in (defaults_block.group(1).splitlines() if defaults_block else []):
+    assignment = re.match(r"^([A-Z][A-Z0-9_]*)=(.*)$", line)
+    if not assignment:
+        continue
+    value = assignment.group(2).strip()
+    if value[:1] in ("'", '"'):
+        value = value[1:value.find(value[0], 1)]
+    hook_defaults[assignment.group(1)] = value
+
+check("hook declares the CEC command keys",
+      sorted(k for k in hook_defaults if k.startswith("CEC_")),
+      ["CEC_COMMAND_DELAY", "CEC_STANDBY_COMMANDS", "CEC_WAKE_COMMANDS"])
+for key, expected in sorted(hook_defaults.items()):
+    check("%s matches cec-hook.sh's fallback" % key, values.get(key), expected)
+
+declared_keys = set(re.findall(r"^([A-Z][A-Z0-9_]*)=", open(CONFIG_SRC).read(), re.M))
+known_keys = set(w.DEFAULTS) | set(hook_defaults)
+check("config ships no key nothing reads", sorted(declared_keys - known_keys), [])
+check("config ships every key the code knows", sorted(known_keys - declared_keys), [])
+
+check.section("payload scripts are runnable as installed")
 check("cec-hook.sh has a shebang", hook.startswith("#!"), True)
 for action in ("on", "off", "dpcd-status"):
     check("cec-hook.sh handles '%s'" % action,
@@ -116,6 +141,10 @@ check("cec-hook.sh keeps the DPCD tunneling fix",
       "DPCD_CEC_TUNNELING_CONTROL=12289" in hook, True)
 check("cec-hook.sh still rewrites the enable bit",
       "enable_cec_tunneling" in hook, True)
+check("wake sends the configured list, not a hardcoded chain",
+      'run_cec_commands "$CEC_WAKE_COMMANDS"' in hook, True)
+check("standby sends the configured list",
+      'run_cec_commands "$CEC_STANDBY_COMMANDS"' in hook, True)
 
 with open(os.path.join(REPO_ROOT, "src", "cec-controller-watch.py"), errors="replace") as fh:
     daemon = fh.read()

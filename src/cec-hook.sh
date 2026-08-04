@@ -11,9 +11,20 @@ CONFIG_FILE="$CEC_DIR/config.conf"
 LOGFILE="$CEC_DIR/cec-hook.log"
 ACTION="${1:-}"
 
-# Log rotation defaults; config.conf may override them.
+# --- config defaults (mirrored in config/config.conf.default) ----------------
+# Every key config.conf may override, with the value used when it does not.
+# tests/test_packaging.py asserts this block and the shipped config agree, so
+# add a default here and in config.conf.default or the test suite says so.
 LOG_MAX_BYTES=1048576
 LOG_KEEP=2
+# The CEC conversation itself: ";"-separated list of cec-ctl argument sets, one
+# invocation each, run in order CEC_COMMAND_DELAY seconds apart. {phys_addr} is
+# substituted with the address detected at run time. See config.conf.default.
+CEC_WAKE_COMMANDS="-v -s -t0 --cec-version-1.4 --user-control-pressed=ui-cmd=power-on-function; -v -s -t0 --cec-version-1.4 --image-view-on; -v -s -t0 --cec-version-1.4 --set-stream-path=phys-addr={phys_addr}; -v -s --cec-version-1.4 --active-source=phys-addr={phys_addr}"
+CEC_STANDBY_COMMANDS="--to 0 --standby"
+CEC_COMMAND_DELAY=1
+# --- end config defaults -----------------------------------------------------
+
 # shellcheck source=/dev/null
 [ -r "$CONFIG_FILE" ] && . "$CONFIG_FILE" 2>/dev/null || true
 
@@ -66,6 +77,59 @@ get_phys_addr() {
         i=$((i + 1))
     done
     return 1
+}
+
+# True when a configured command list holds at least one command rather than
+# just separators and whitespace.
+has_commands() {
+    [ -n "${1//[[:space:];]/}" ]
+}
+
+# Runs a configured command list (CEC_WAKE_COMMANDS / CEC_STANDBY_COMMANDS):
+# ";" separates cec-ctl invocations, "{phys_addr}" is substituted with $2, and
+# CEC_COMMAND_DELAY seconds pass between them. Stops at the first failure, the
+# way the hardcoded "&&" chain it replaces did. Everything goes to stdout so a
+# caller can log it and still grep it for a TV NACK.
+run_cec_commands() {
+    local list="$1" phys="${2:-}"
+    local delay="${CEC_COMMAND_DELAY:-1}"
+    local rest entry status ran=0
+    local -a args
+
+    if ! has_commands "$list"; then
+        echo "ERROR: no cec-ctl commands configured (empty command list)"
+        return 1
+    fi
+
+    case "$delay" in
+        ''|*[!0-9.]*)
+            echo "WARNING: CEC_COMMAND_DELAY='$delay' is not a number, using 1"
+            delay=1
+            ;;
+    esac
+
+    rest="$list"
+    while [ -n "$rest" ]; do
+        entry="${rest%%;*}"
+        if [ "$entry" = "$rest" ]; then rest=""; else rest="${rest#*;}"; fi
+        entry="${entry//\{phys_addr\}/$phys}"
+
+        # read -a word-splits on whitespace without the pathname expansion a
+        # bare $entry would do, so a "*" in an argument stays a "*".
+        read -r -a args <<< "$entry"
+        [ "${#args[@]}" -eq 0 ] && continue
+
+        [ "$ran" -eq 1 ] && sleep "$delay"
+        ran=1
+
+        cec-ctl "${args[@]}"
+        status=$?
+        if [ "$status" -ne 0 ]; then
+            echo "ERROR: 'cec-ctl ${args[*]}' exited $status"
+            return "$status"
+        fi
+    done
+    return 0
 }
 
 OSD_NAME="steamdeck"
@@ -184,6 +248,14 @@ reinit_cec_hard() {
 
 case "$ACTION" in
   on)
+    # Checked before anything else: an empty list would otherwise fail its way
+    # through the whole retry escalation below, including a DRM re-probe that
+    # blanks the display, to say something a config typo could say instantly.
+    if ! has_commands "$CEC_WAKE_COMMANDS"; then
+        log "ERROR: CEC_WAKE_COMMANDS is empty in $CONFIG_FILE, nothing to send"
+        exit 1
+    fi
+
     if ! wait_for_device; then
         log "ERROR: $CEC_DEV never appeared, aborting"
         exit 1
@@ -225,13 +297,7 @@ case "$ACTION" in
             fi
         fi
 
-        WAKE_OUT=$( { cec-ctl -v -s -t0 --cec-version-1.4 --user-control-pressed=ui-cmd=power-on-function && \
-          sleep 1 && \
-          cec-ctl -v -s -t0 --cec-version-1.4 --image-view-on && \
-          sleep 1 && \
-          cec-ctl -v -s -t0 --cec-version-1.4 --set-stream-path=phys-addr="$PHYS_ADDR" && \
-          sleep 1 && \
-          cec-ctl -v -s --cec-version-1.4 --active-source=phys-addr="$PHYS_ADDR"; } 2>&1 )
+        WAKE_OUT=$(run_cec_commands "$CEC_WAKE_COMMANDS" "$PHYS_ADDR" 2>&1)
         WAKE_STATUS=$?
         echo "$WAKE_OUT" | tee -a "$LOGFILE"
 
@@ -257,9 +323,11 @@ case "$ACTION" in
         exit 0
     fi
 
-    cec-ctl --to 0 --standby 2>&1 | tee -a "$LOGFILE"
+    STANDBY_OUT=$(run_cec_commands "$CEC_STANDBY_COMMANDS" 2>&1)
+    STANDBY_STATUS=$?
+    echo "$STANDBY_OUT" | tee -a "$LOGFILE"
 
-    if [ "$?" -eq 0 ]; then
+    if [ "$STANDBY_STATUS" -eq 0 ]; then
         log "Standby sent OK"
     else
         log "ERROR: standby command failed"

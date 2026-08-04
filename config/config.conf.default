@@ -6,6 +6,41 @@
 # always mirrored to config.conf.default so you can diff after an upgrade.
 #
 # After editing:  sudo systemctl restart cec-hdmi-controller.service
+# (only the CONTROLLER keys need that restart - cec-hook.sh re-reads this file
+# on every wake/standby, so the CEC command keys below take effect immediately.)
+
+
+# --- what gets sent over CEC -------------------------------------------------
+#
+# Both lists are semicolon-separated sets of cec-ctl arguments: each entry is
+# one cec-ctl invocation, run in order, CEC_COMMAND_DELAY seconds apart, and the
+# sequence stops at the first command that fails.
+#
+#   {phys_addr}   replaced with this PC's HDMI physical address (e.g. 3.0.0.0),
+#                 re-detected on every run so it survives a port/cable change
+#   -t0 / --to 0  address the message to logical device 0, which is the TV
+#   -s            skip cec-ctl's adapter info dump
+#   -v            verbose. KEEP IT: the retry logic decides whether the TV
+#                 acknowledged by looking for "Not Acknowledged" in this output
+#
+# The default wake sequence: a remote-control "power on" keypress, the standard
+# CEC wake, "switch to my HDMI port", then "I am the active source". TVs vary in
+# which of these they honour - some need only --image-view-on, some ignore
+# --user-control-pressed, some want --active-source repeated. Trying a different
+# sequence is what this key is for; run "sudo bash /etc/cec-hdmi/cec-hook.sh on"
+# after each edit and watch /etc/cec-hdmi/cec-hook.log.
+CEC_WAKE_COMMANDS="-v -s -t0 --cec-version-1.4 --user-control-pressed=ui-cmd=power-on-function; -v -s -t0 --cec-version-1.4 --image-view-on; -v -s -t0 --cec-version-1.4 --set-stream-path=phys-addr={phys_addr}; -v -s --cec-version-1.4 --active-source=phys-addr={phys_addr}"
+
+# Sent on suspend, shutdown and reboot. Some setups prefer broadcasting standby
+# to everything on the bus: CEC_STANDBY_COMMANDS="--to 15 --standby"
+CEC_STANDBY_COMMANDS="--to 0 --standby"
+
+# Seconds to wait between the commands of a list. A TV that has just powered on
+# can drop messages that arrive back to back; 0 sends them without a pause.
+CEC_COMMAND_DELAY=1
+
+
+# --- controller watcher ------------------------------------------------------
 
 # Ignore further Home-button presses for this many seconds after one fires.
 # Also covers the duplicate events you get when Steam mirrors a physical pad
