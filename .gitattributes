@@ -1,0 +1,14 @@
+# Everything here is destined for a Linux box. A CRLF that reaches the Deck
+# turns "#!/usr/bin/env bash" into "bash\r" and the script dies with a
+# "bad interpreter" error that names a binary that looks correct. Pin LF in the
+# repository and in every checkout, so this does not depend on each
+# contributor's core.autocrlf setting.
+* text=auto eol=lf
+
+*.sh      text eol=lf
+*.py      text eol=lf
+*.service text eol=lf
+*.conf    text eol=lf
+*.default text eol=lf
+*.md      text eol=lf
+VERSION   text eol=lf

@@ -66,14 +66,20 @@ wait_for_device() {
     [ -e "$CEC_DEV" ]
 }
 
+# A physical address is four hex nibbles, "x.x.x.x". One definition, used both
+# where the address is read and again before it is handed to cec-ctl.
+valid_phys_addr() {
+    [[ "${1:-}" =~ ^[0-9a-fA-F]\.[0-9a-fA-F]\.[0-9a-fA-F]\.[0-9a-fA-F]$ ]]
+}
+
 get_phys_addr() {
     local pa i=0
     local max_tries=20
     while [ "$i" -lt "$max_tries" ]; do
         pa=$(cec-ctl -s -x 2>/dev/null)
         echo "$(date '+%F %T') [cec-hook:get-phys-addr] attempt $((i + 1))/$max_tries: '$pa'" >> "$LOGFILE"
-        if [[ "$pa" =~ ^[0-9a-fA-F]\.[0-9a-fA-F]\.[0-9a-fA-F]\.[0-9a-fA-F]$ ]] && [ "$pa" != "f.f.f.f" ]; then
-            printf '%s' "$pa"If you want, I can also give you a minimal test sequence with image-view-on, active-source, and system-audio-mode-request in the most reliable order.
+        if valid_phys_addr "$pa" && [ "$pa" != "f.f.f.f" ]; then
+            printf '%s' "$pa"
             return 0
         fi
         sleep 1
@@ -208,7 +214,7 @@ find_aux_dev() {
 
 # THE key fix. After a suspend/resume the dongle's CEC engine comes back with
 # DP_CEC_TUNNELING_CONTROL cleared, and the kernel never rewrites it because
-# the EDID is unchanged - so CEC looks alive but NACIf you want, I can also give you a minimal test sequence with image-view-on, active-source, and system-audio-mode-request in the most reliable order.Ks every directed message.
+# the EDID is unchanged - so CEC looks alive but NACKs every directed message.
 # Writing the enable bit back restores it without a physical cable reseat.
 enable_cec_tunneling() {
     local aux cur
@@ -325,6 +331,17 @@ case "$ACTION" in
             fi
         fi
 
+        # Point-of-use guard. get_phys_addr validates what it returns, but that
+        # only covers one route into this variable - a corrupted script or a
+        # stray assignment can still get junk here, and cec-ctl's response to
+        # that is "Invalid suboptions specified" once per retry, which reads
+        # like a TV problem rather than a malformed argument. Fail clearly.
+        if ! valid_phys_addr "$PHYS_ADDR"; then
+            log "ERROR: refusing to send a malformed physical address: '$PHYS_ADDR'"
+            log "       expected x.x.x.x - check $0 for corruption"
+            exit 1
+        fi
+
         WAKE_OUT=$(run_cec_commands "$CEC_WAKE_COMMANDS" "$PHYS_ADDR" 2>&1)
         WAKE_STATUS=$?
         echo "$WAKE_OUT" | tee -a "$LOGFILE"
@@ -340,7 +357,7 @@ case "$ACTION" in
 
     if [ "$ACKED" -eq 0 ]; then
         log "Wake sequence sent OK (phys-addr=$PHYS_ADDR)"
-        wake_audio_sIf you want, I can also give you a minimal test sequence with image-view-on, active-source, and system-audio-mode-request in the most reliable order.ystem "$PHYS_ADDR"
+        wake_audio_system "$PHYS_ADDR"
     else
         log "ERROR: TV never acknowledged the wake commands after $max_wake_tries attempts"
         exit 1

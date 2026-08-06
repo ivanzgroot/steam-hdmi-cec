@@ -133,6 +133,35 @@ known_keys = set(w.DEFAULTS) | set(hook_defaults)
 check("config ships no key nothing reads", sorted(declared_keys - known_keys), [])
 check("config ships every key the code knows", sorted(known_keys - declared_keys), [])
 
+check.section("no prose pasted into the sources")
+# A real incident: assistant prose got pasted into cec-hook.sh mid-line, turning
+#     printf '%s' "$pa"
+# into
+#     printf '%s' "$pa"If you want, I can also give you a minimal test ...
+# which is *valid shell* - printf reuses "%s" for every extra argument - so
+# `bash -n` passed and the corruption reached the TV as a malformed physical
+# address. The same paste also split wake_audio_system into wake_audio_s...ystem.
+# Syntax checking cannot catch this, so look for the shape of the mistake.
+PROSE = re.compile(
+    r"\b(?:if you want|I can also give you|let me know if|here'?s (?:a|the) "
+    r"(?:version|updated)|would you like me to)\b", re.I)
+with open(os.path.join(REPO_ROOT, "src", "cec-controller-watch.py"),
+          errors="replace") as fh:
+    daemon = fh.read()
+
+for label, text in (("cec-hook.sh", hook), ("cec-controller-watch.py", daemon),
+                    ("config.conf.default", open(CONFIG_SRC).read())):
+    hits = [(n, line.strip()[:90])
+            for n, line in enumerate(text.splitlines(), 1) if PROSE.search(line)]
+    check("no assistant prose in %s" % label, hits, [])
+
+# The specific line the paste landed on, asserted verbatim: it is the only
+# stdout in get_phys_addr, so anything appended to it corrupts the address.
+check("get_phys_addr emits the address and nothing else",
+      re.search(r"^\s*printf '%s' \"\$pa\"\s*$", hook, re.M) is not None, True)
+check("the address is validated again at the point of use",
+      'if ! valid_phys_addr "$PHYS_ADDR"; then' in hook, True)
+
 check.section("payload scripts are runnable as installed")
 check("cec-hook.sh has a shebang", hook.startswith("#!"), True)
 for action in ("on", "off", "dpcd-status"):
@@ -150,8 +179,6 @@ check("the audio/AVR request runs only after a wake the TV acknowledged",
       re.search(r'log "Wake sequence sent OK[^\n]*\n\s*wake_audio_system', hook) is not None,
       True)
 
-with open(os.path.join(REPO_ROOT, "src", "cec-controller-watch.py"), errors="replace") as fh:
-    daemon = fh.read()
 check("daemon has a python3 shebang", daemon.startswith("#!/usr/bin/env python3"), True)
 check("daemon shells out to cec-hook.sh rather than speaking CEC",
       'HOOK_SCRIPT, "on"' in daemon, True)
