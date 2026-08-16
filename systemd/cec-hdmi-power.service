@@ -4,8 +4,8 @@ Description=HDMI-CEC: wake TV and switch to this PC on boot; standby on shutdown
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/etc/cec-hdmi/cec-hook.sh on
-ExecStop=/etc/cec-hdmi/cec-hook.sh off
+ExecStart=/etc/cec-hdmi/cec-hook.py on
+ExecStop=/etc/cec-hdmi/cec-hook.py off
 TimeoutStartSec=150
 TimeoutStopSec=15
 

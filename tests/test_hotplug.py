@@ -2,9 +2,9 @@
 
 import sys
 
-from _harness import Checks, load_daemon
+from _harness import Checks, load_watcher
 
-w = load_daemon()
+w = load_watcher()
 check = Checks()
 
 
@@ -48,11 +48,9 @@ class FakeConfig:
     cooldown = 2.5
     dry_run = False
     gamepad_only = False
-    trigger_codes = {316}
     rescan = 5.0
     notify_on_trigger = False
     notify_on_failure = True
-    unknown_codes = []
     problems = []
     path = "<fake>"
 
@@ -76,7 +74,7 @@ def uevent(action, subsystem, devname=None):
 
 
 def make(messages, log=None):
-    watcher = w.ControllerWatcher(FakeConfig(), log or (lambda m: None))
+    watcher = w.ControllerWatcher(FakeConfig(), log or (lambda m: None), {316})
     watcher.loop = FakeLoop()
     watcher.netlink = FakeSock(messages)
     return watcher
@@ -139,7 +137,7 @@ class ExplodingSock(FakeSock):
         raise OSError("socket blew up")
 
 
-wt = w.ControllerWatcher(FakeConfig(), lambda m: None)
+wt = w.ControllerWatcher(FakeConfig(), lambda m: None, {316})
 wt.loop = FakeLoop()
 wt.netlink = ExplodingSock([])
 wt.loop.readers[3] = None

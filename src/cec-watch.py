@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""cec-controller-watch - wake the TV when a controller's Home/Guide button is pressed.
+"""cec-watch - wake the TV when a controller's Home/Guide button is pressed.
 
 Watches every connected input device that advertises one of the configured
-trigger button codes, picks hotplugged controllers up and dropped ones down
-live, debounces, and shells out to /etc/cec-hdmi/cec-hook.sh on.
+trigger codes, picks hotplugged controllers up and dropped ones down live,
+debounces, and runs `cec-hook.py on`.
 
-It never speaks CEC itself. cec-hook.sh owns all of that, including the DPCD
-0x3001 CEC-tunneling re-enable that post-suspend wakes depend on.
+It never speaks CEC itself. cec-hook owns all of that, including the DisplayPort
+tunneling fix that post-suspend wakes depend on, and it stays a separate process
+on purpose: a wake can block for tens of seconds while the retry escalation
+runs, and the input loop has to keep reading throughout.
 
 Standard library only - no evdev, no pyudev, no pip, no venv. Devices are
-enumerated through sysfs (/sys/class/input/event*/device/...), read as raw
-struct input_event from /dev/input/event*, and hotplug arrives on a netlink
-uevent socket. That keeps a read-only SteamOS root with no compiler viable.
+enumerated through sysfs, read as raw struct input_event from /dev/input/event*,
+and hotplug arrives on a netlink uevent socket. That keeps a read-only SteamOS
+root with no compiler viable.
 
 Modes:
     (no args)   run as a daemon; what cec-hdmi-controller.service does
@@ -30,11 +32,14 @@ import struct
 import sys
 import time
 
-VERSION = "2.1.0"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-CEC_DIR = "/etc/cec-hdmi"
-DEFAULT_CONFIG = os.path.join(CEC_DIR, "config.conf")
-HOOK_SCRIPT = os.path.join(CEC_DIR, "cec-hook.sh")
+from cec_config import CEC_DIR, Config, DEFAULT_CONFIG          # noqa: E402
+from cec_log import Logger                                      # noqa: E402
+
+VERSION = "3.0.0"
+
+HOOK_SCRIPT = os.path.join(CEC_DIR, "cec-hook.py")
 DEFAULT_LOG = os.path.join(CEC_DIR, "cec-controller.log")
 
 SYS_INPUT = "/sys/class/input"
@@ -59,22 +64,10 @@ UEVENT_KERNEL_GROUP = 1
 # announces the device before udev has applied its root:input 0660 permissions.
 HOTPLUG_RETRY_DELAYS = (0.3, 1.0, 3.0)
 
-DEFAULTS = {
-    "COOLDOWN_SECONDS": "2.5",
-    "BUTTON_CODES": "BTN_MODE BTN_HOME KEY_HOMEPAGE",
-    "GAMEPAD_ONLY": "0",
-    "DRY_RUN": "0",
-    "RESCAN_SECONDS": "5",
-    "NOTIFY_ON_TRIGGER": "0",
-    "NOTIFY_ON_FAILURE": "1",
-    "LOG_MAX_BYTES": "1048576",
-    "LOG_KEEP": "2",
-}
-
 # Enough of linux/input-event-codes.h to resolve the names anyone would
-# reasonably put in BUTTON_CODES. Augmented at runtime from the real header
-# when it is present. Order matters: the first name listed for a code is the
-# one used when printing that code back out.
+# reasonably put in BUTTON_CODES. Augmented at runtime from the real header when
+# it is present. Order matters: the first name listed for a code is the one used
+# when printing that code back out.
 BASE_KEY_NAMES = {
     "BTN_SOUTH": 0x130, "BTN_A": 0x130, "BTN_GAMEPAD": 0x130,
     "BTN_EAST": 0x131, "BTN_B": 0x131,
@@ -102,8 +95,8 @@ def load_key_names():
     names = dict(BASE_KEY_NAMES)
     aliases = []
     try:
-        with open(KERNEL_CODE_HEADER, "r", errors="replace") as fh:
-            for line in fh:
+        with open(KERNEL_CODE_HEADER, "r", errors="replace") as handle:
+            for line in handle:
                 match = _DEFINE_RE.match(line.strip())
                 if not match:
                     continue
@@ -137,152 +130,13 @@ def fmt_codes(codes):
     return ", ".join("%s(%d)" % (code_name(c), c) for c in codes) or "none"
 
 
-# --------------------------------------------------------------------------- config
-
-
-def read_config(path):
-    """Parse the bash-sourceable KEY=VALUE config. Unknown keys are kept, bad
-    lines are skipped; a broken config must never stop the watcher from running."""
-    values = dict(DEFAULTS)
-    problems = []
-    try:
-        with open(path, "r", errors="replace") as fh:
-            for lineno, raw in enumerate(fh, 1):
-                line = raw.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if line.startswith("export "):
-                    line = line[len("export "):].lstrip()
-                key, sep, value = line.partition("=")
-                key = key.strip()
-                if not sep or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
-                    problems.append("line %d: not a KEY=VALUE assignment" % lineno)
-                    continue
-                value = value.strip()
-                if value[:1] in ("'", '"'):
-                    quote = value[0]
-                    end = value.find(quote, 1)
-                    value = value[1:end] if end > 0 else value[1:]
-                else:
-                    value = value.split("#", 1)[0].strip()
-                values[key] = value
-    except FileNotFoundError:
-        problems.append("%s not found, using built-in defaults" % path)
-    except OSError as exc:
-        problems.append("could not read %s: %s" % (path, exc))
-    return values, problems
-
-
-class Config:
-    def __init__(self, path=DEFAULT_CONFIG):
-        self.path = path
-        self.values, self.problems = read_config(path)
-        self.cooldown = self._number("COOLDOWN_SECONDS", float, minimum=0.0)
-        self.rescan = self._number("RESCAN_SECONDS", float, minimum=1.0)
-        self.log_max_bytes = self._number("LOG_MAX_BYTES", int, minimum=0)
-        self.log_keep = self._number("LOG_KEEP", int, minimum=0)
-        self.gamepad_only = self._bool("GAMEPAD_ONLY")
-        self.dry_run = self._bool("DRY_RUN")
-        self.notify_on_trigger = self._bool("NOTIFY_ON_TRIGGER")
-        self.notify_on_failure = self._bool("NOTIFY_ON_FAILURE")
-        self.trigger_codes, self.unknown_codes = self._codes()
-
-    def _number(self, key, cast, minimum=None):
-        raw = self.values.get(key, DEFAULTS[key])
-        try:
-            value = cast(raw)
-        except (TypeError, ValueError):
-            self.problems.append("%s=%r is not a number, using %s" % (key, raw, DEFAULTS[key]))
-            return cast(DEFAULTS[key])
-        if minimum is not None and value < minimum:
-            self.problems.append("%s=%r below minimum %s, clamping" % (key, raw, minimum))
-            return cast(minimum)
-        return value
-
-    def _bool(self, key):
-        raw = str(self.values.get(key, DEFAULTS[key])).strip().lower()
-        if raw in ("1", "yes", "true", "on"):
-            return True
-        if raw in ("0", "no", "false", "off", ""):
-            return False
-        self.problems.append("%s=%r is not a boolean, using %s" % (key, raw, DEFAULTS[key]))
-        return DEFAULTS[key] == "1"
-
-    def _codes(self):
-        raw = self.values.get("BUTTON_CODES", DEFAULTS["BUTTON_CODES"])
-        codes, unknown = set(), []
-        for token in re.split(r"[\s,]+", raw.strip()):
-            if not token:
-                continue
-            upper = token.upper()
-            if upper in KEY_NAMES:
-                codes.add(KEY_NAMES[upper])
-                continue
-            try:
-                codes.add(int(token, 0))
-            except ValueError:
-                unknown.append(token)
-        if not codes:
-            self.problems.append(
-                "BUTTON_CODES=%r resolved to nothing, falling back to BTN_MODE" % raw)
-            codes.add(KEY_NAMES["BTN_MODE"])
-        return codes, unknown
-
-
-# --------------------------------------------------------------------------- logging
-
-
-class Logger:
-    """Timestamped lines to both the log file and stdout (which systemd captures
-    into the journal), matching cec-hook.sh's format. Size-capped in place."""
-
-    def __init__(self, path=DEFAULT_LOG, max_bytes=0, keep=2, tag="cec-controller", echo=True):
-        self.path = path
-        self.max_bytes = max_bytes
-        self.keep = keep
-        self.tag = tag
-        self.echo = echo
-
-    def _rotate_if_needed(self):
-        if self.max_bytes <= 0:
-            return
-        try:
-            if os.path.getsize(self.path) < self.max_bytes:
-                return
-        except OSError:
-            return
-        try:
-            for index in range(self.keep, 1, -1):
-                older = "%s.%d" % (self.path, index - 1)
-                if os.path.exists(older):
-                    os.replace(older, "%s.%d" % (self.path, index))
-            if self.keep >= 1:
-                os.replace(self.path, self.path + ".1")
-            else:
-                os.unlink(self.path)
-        except OSError:
-            pass
-
-    def __call__(self, message):
-        line = "%s [%s] %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), self.tag, message)
-        if self.echo:
-            print(line, flush=True)
-        try:
-            self._rotate_if_needed()
-            with open(self.path, "a", errors="replace") as fh:
-                fh.write(line + "\n")
-        except OSError as exc:
-            print("%s [%s] WARNING: cannot write %s: %s"
-                  % (time.strftime("%Y-%m-%d %H:%M:%S"), self.tag, self.path, exc), flush=True)
-
-
 # --------------------------------------------------------------------------- devices
 
 
 def _read_sysfs(path):
     try:
-        with open(path, "r", errors="replace") as fh:
-            return fh.read().strip()
+        with open(path, "r", errors="replace") as handle:
+            return handle.read().strip()
     except OSError:
         return ""
 
@@ -294,7 +148,9 @@ def parse_bitmap(text, word_bits=LONG_BITS):
     first, space separated, formatted with plain "%lx" - so words are NOT zero
     padded ("7cdb000000000000 0 0 0 0") and their text length says nothing about
     the word size. It is always BITS_PER_LONG, which for a native process is
-    sizeof(long) * 8.
+    sizeof(long) * 8. Getting this wrong shifts every button number, and does so
+    silently: the daemon starts, reports itself healthy, and quietly decides
+    your controller has no Home button.
     """
     words = text.split()
     if not words:
@@ -402,10 +258,10 @@ async def notify(log, summary, body, urgency="normal"):
 
 
 class ControllerWatcher:
-    def __init__(self, config, log):
+    def __init__(self, config, log, trigger_codes):
         self.config = config
         self.log = log
-        self.trigger_codes = config.trigger_codes
+        self.trigger_codes = trigger_codes
         self.open_devices = {}
         self.open_failures = {}
         self.last_trigger = float("-inf")
@@ -521,14 +377,17 @@ class ControllerWatcher:
         self.loop.create_task(self._run_hook())
 
     async def _run_hook(self):
-        """Run cec-hook.sh out of band. The wake sequence can take tens of
-        seconds when the DPCD fix and retry escalation kick in, and the input
-        loop has to keep reading throughout."""
+        """Run cec-hook out of band.
+
+        A wake can take tens of seconds when the tunneling fix and the retry
+        escalation kick in, and the input loop has to keep reading throughout -
+        which is why this stays a subprocess rather than an import.
+        """
         started = time.monotonic()
         status = -1
         try:
             proc = await asyncio.create_subprocess_exec(
-                HOOK_SCRIPT, "on",
+                sys.executable, HOOK_SCRIPT, "on", "--quiet",
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
@@ -541,11 +400,11 @@ class ControllerWatcher:
 
         took = time.monotonic() - started
         if status == 0:
-            self.log("wake sequence finished OK in %.1fs" % took)
+            self.log("wake finished OK in %.1fs" % took)
             if self.config.notify_on_trigger:
                 await notify(self.log, "TV woken", "HDMI-CEC wake sent from the controller.")
         else:
-            self.log("ERROR: wake sequence failed (exit %d) after %.1fs - see %s"
+            self.log("ERROR: wake failed (exit %d) after %.1fs - see %s"
                      % (status, took, os.path.join(CEC_DIR, "cec-hook.log")))
             if self.config.notify_on_failure:
                 await notify(self.log, "HDMI-CEC wake failed",
@@ -630,13 +489,10 @@ class ControllerWatcher:
             except (NotImplementedError, RuntimeError):
                 pass
 
-        self.log("cec-controller-watch %s starting (config: %s)" % (VERSION, self.config.path))
+        self.log("cec-watch %s starting (config: %s)" % (VERSION, self.config.path))
         for problem in self.config.problems:
             self.log("config: %s" % problem)
         self.log("trigger codes: %s" % fmt_codes(sorted(self.trigger_codes)))
-        if self.config.unknown_codes:
-            self.log("config: BUTTON_CODES entries this kernel does not define, ignored: %s"
-                     % ", ".join(self.config.unknown_codes))
         self.log("cooldown: %.1fs | gamepad-only: %s | dry-run: %s"
                  % (self.config.cooldown,
                     "yes" if self.config.gamepad_only else "no",
@@ -667,18 +523,19 @@ class ControllerWatcher:
 # --------------------------------------------------------------------------- detect
 
 
-def run_detect(config):
+def run_detect(config, trigger_codes, unknown_codes):
     """List every input device and say exactly which ones the daemon watches."""
-    print("cec-controller-watch %s" % VERSION)
+    print("cec-watch %s" % VERSION)
     print("config:         %s" % config.path)
     for problem in config.problems:
         print("  config note:  %s" % problem)
-    print("trigger codes:  %s" % fmt_codes(sorted(config.trigger_codes)))
-    if config.unknown_codes:
-        print("  not defined by this kernel, ignored: %s" % ", ".join(config.unknown_codes))
+    print("trigger codes:  %s" % fmt_codes(sorted(trigger_codes)))
+    if unknown_codes:
+        print("  not defined by this kernel, ignored: %s" % ", ".join(unknown_codes))
     print("gamepad-only:   %s" % ("yes" if config.gamepad_only else "no"))
     print("cooldown:       %.1fs%s"
-          % (config.cooldown, "  (DRY RUN - hook will not be called)" if config.dry_run else ""))
+          % (config.cooldown, "  (DRY RUN - hook will not be called)"
+             if config.dry_run else ""))
     if os.geteuid() != 0:
         print("\nNOTE: not running as root; /dev/input/event* is usually root:input 0660,")
         print("      so 'readable' below will say no. Re-run with sudo for a true picture.")
@@ -691,7 +548,7 @@ def run_detect(config):
 
     watched = 0
     for device in devices:
-        matched = sorted(config.trigger_codes & device.keys)
+        matched = sorted(trigger_codes & device.keys)
         try:
             fd = os.open(device.path, os.O_RDONLY | os.O_NONBLOCK)
             os.close(fd)
@@ -733,14 +590,14 @@ def run_detect(config):
 # --------------------------------------------------------------------------- monitor
 
 
-def run_monitor(config):
-    """Print every key-down event from every readable input device.
+def run_monitor(config, trigger_codes):
+    """Print every key event from every readable input device.
 
     This is the tool for the open question Steam raises on SteamOS: whether the
     Guide/Home button is visible on the raw evdev node while Steam is running,
-    or whether Steam consumes it. Run it in Desktop Mode and again with Gaming
-    Mode on screen (over SSH - /dev/input does not care which UI is in front),
-    press Home, and see whether an event shows up.
+    or whether Steam consumes it first. Run it in Desktop Mode and again with
+    Gaming Mode on screen (over SSH - /dev/input does not care which UI is in
+    front), press Home, and see whether an event shows up.
 
     Nothing here grabs a device (no EVIOCGRAB), so Steam's own input handling,
     the overlay and games are unaffected while this runs.
@@ -751,7 +608,7 @@ def run_monitor(config):
         print("NOTE: not running as root; most /dev/input/event* nodes will be "
               "unreadable. Re-run with sudo.\n")
 
-    print("cec-controller-watch %s - live key monitor" % VERSION)
+    print("cec-watch %s - live key monitor" % VERSION)
     print("Passive read only, no EVIOCGRAB: Steam keeps full control of input.")
     print("Press buttons on your controller. Ctrl-C to stop.\n")
 
@@ -771,7 +628,7 @@ def run_monitor(config):
             device.fd = fd
             watching[device.path] = device
             selector.register(fd, selectors.EVENT_READ, device)
-            triggers = sorted(config.trigger_codes & device.keys)
+            triggers = sorted(trigger_codes & device.keys)
             print("+ %-22s %s%s"
                   % (device.path, device.name,
                      "   [has trigger: %s]" % fmt_codes(triggers) if triggers else ""))
@@ -816,7 +673,7 @@ def run_monitor(config):
                         continue
                     action = {0: "release", 1: "PRESS", 2: "repeat"}.get(value, str(value))
                     mark = "  <-- would trigger a wake" if (
-                        value == 1 and code in config.trigger_codes) else ""
+                        value == 1 and code in trigger_codes) else ""
                     print("%s  %-22s %-28s %-16s %-7s code=%d%s"
                           % (time.strftime("%H:%M:%S"), device.path, device.name[:28],
                              code_name(code), action, code, mark))
@@ -841,7 +698,7 @@ def run_monitor(config):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        prog="cec-controller-watch",
+        prog="cec-watch",
         description="Wake the TV over HDMI-CEC when a controller's Home/Guide "
                     "button is pressed.",
         epilog="With no mode flag it runs as a daemon, which is what "
@@ -852,13 +709,13 @@ def main(argv=None):
     parser.add_argument("--monitor", action="store_true",
                         help="print key events live to find your Home button's code")
     parser.add_argument("--dry-run", action="store_true",
-                        help="log 'would trigger' instead of running cec-hook.sh "
+                        help="log 'would trigger' instead of running cec-hook "
                              "(overrides DRY_RUN in the config)")
     parser.add_argument("--config", default=DEFAULT_CONFIG, metavar="PATH",
                         help="config file to read (default: %(default)s)")
     parser.add_argument("--log", default=DEFAULT_LOG, metavar="PATH",
                         help="log file to append to (default: %(default)s)")
-    parser.add_argument("--version", action="version", version="cec-controller-watch " + VERSION)
+    parser.add_argument("--version", action="version", version="cec-watch " + VERSION)
     args = parser.parse_args(argv)
 
     if args.detect and args.monitor:
@@ -867,15 +724,20 @@ def main(argv=None):
     config = Config(args.config)
     if args.dry_run:
         config.dry_run = True
+    trigger_codes, unknown_codes = config.button_codes(KEY_NAMES)
 
     if args.detect:
-        return run_detect(config)
+        return run_detect(config, trigger_codes, unknown_codes)
     if args.monitor:
-        return run_monitor(config)
+        return run_monitor(config, trigger_codes)
 
-    log = Logger(args.log, max_bytes=config.log_max_bytes, keep=config.log_keep)
+    log = Logger(args.log, tag="cec-watch",
+                 max_bytes=config.log_max_bytes, keep=config.log_keep)
+    if unknown_codes:
+        log("config: BUTTON_CODES entries this kernel does not define, ignored: %s"
+            % ", ".join(unknown_codes))
     try:
-        return asyncio.run(ControllerWatcher(config, log).run())
+        return asyncio.run(ControllerWatcher(config, log, trigger_codes).run())
     except KeyboardInterrupt:
         return 0
 

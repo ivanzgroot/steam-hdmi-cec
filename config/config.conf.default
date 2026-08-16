@@ -1,62 +1,147 @@
 # /etc/cec-hdmi/config.conf
 #
-# Plain KEY=VALUE. Sourced by cec-hook.sh (bash) and parsed by
-# cec-controller-watch.py (no shell expansion there - keep values literal).
-# Re-running install.sh never overwrites this file; the shipped defaults are
-# always mirrored to config.conf.default so you can diff after an upgrade.
+# Plain KEY=VALUE, read by Python and nothing else. Nothing in this file is
+# executed - values are data. Re-running install.sh never overwrites this file;
+# the shipped defaults are always mirrored to config.conf.default so you can
+# diff after an upgrade.
 #
 # After editing:  sudo systemctl restart cec-hdmi-controller.service
-# (only the CONTROLLER keys need that restart - cec-hook.sh re-reads this file
-# on every wake/standby, so the CEC command keys below take effect immediately.)
+# Only the CONTROLLER keys need that restart. cec-hook re-reads this file on
+# every wake and standby, so everything above them takes effect immediately.
+#
+# To see what your current settings would actually do, without touching the TV:
+#   sudo /etc/cec-hdmi/cec-hook.py on --dry-run
 
 
-# --- what gets sent over CEC -------------------------------------------------
-#
-# Both lists are semicolon-separated sets of cec-ctl arguments: each entry is
-# one cec-ctl invocation, run in order, CEC_COMMAND_DELAY seconds apart, and the
-# sequence stops at the first command that fails.
-#
-#   {phys_addr}   replaced with this PC's HDMI physical address (e.g. 3.0.0.0),
-#                 re-detected on every run so it survives a port/cable change
-#   -t0 / --to 0  address the message to logical device 0, which is the TV
-#   -s            skip cec-ctl's adapter info dump
-#   -v            verbose. KEEP IT: the retry logic decides whether the TV
-#                 acknowledged by looking for "Not Acknowledged" in this output
-#
-# The default wake sequence: a remote-control "power on" keypress, the standard
-# CEC wake, "switch to my HDMI port", then "I am the active source". TVs vary in
-# which of these they honour - some need only --image-view-on, some ignore
-# --user-control-pressed, some want --active-source repeated. Trying a different
-# sequence is what this key is for; run "sudo bash /etc/cec-hdmi/cec-hook.sh on"
-# after each edit and watch /etc/cec-hdmi/cec-hook.log.
-CEC_WAKE_COMMANDS="-v -s -t0 --cec-version-1.4 --user-control-pressed=ui-cmd=power-on-function; -v -s -t0 --cec-version-1.4 --image-view-on; -v -s -t0 --cec-version-1.4 --set-stream-path=phys-addr={phys_addr}; -v -s --cec-version-1.4 --active-source=phys-addr={phys_addr}"
+# --- the adapter and who we say we are ---------------------------------------
 
-# Sent on suspend, shutdown and reboot. Some setups prefer broadcasting standby
-# to everything on the bus: CEC_STANDBY_COMMANDS="--to 15 --standby"
-# To send the AVR to standby along with the TV, add it as a second command:
-#   CEC_STANDBY_COMMANDS="--to 0 --standby; --to 5 --standby"
-CEC_STANDBY_COMMANDS="--to 0 --standby"
+# The CEC device node. There is normally exactly one.
+CEC_DEVICE="/dev/cec0"
 
-# Audio system / AVR, sent once the TV has acknowledged the wake. "--to 5" is
-# the audio system's logical address, and a System Audio Mode Request carrying
-# our physical address is what makes an AVR power on and switch to this input.
-#
-# This list is best effort: unlike the wake commands, nothing here can fail a
-# wake. With no AVR on the bus, logical address 5 simply does not answer and the
-# log gets one "no audio system answered" line per wake - set the key to ""
-# to stop sending it at all.
-#
-# If your AVR ignores this, run "cec-ctl -s -M" while pressing its power button
-# to see what address it actually uses and which messages it accepts; some want
-# a plain "--to 5 --user-control-pressed=ui-cmd=power-on-function" instead.
-CEC_AUDIO_COMMANDS="-v -s --to 5 --system-audio-mode-request=phys-addr={phys_addr}"
+# The name this PC shows up as in the TV's input list and device menu. Max 14
+# characters (a CEC <Set OSD Name> limit, not ours).
+OSD_NAME="SteamOS"
 
-# Seconds to wait between the commands of a list. A TV that has just powered on
-# can drop messages that arrive back to back; 0 sends them without a pause.
-CEC_COMMAND_DELAY=1
+# What kind of device we register as: playback, tuner or recorder.
+# "playback" is the honest answer for a games console and is what every
+# streaming box uses. It is worth knowing that TVs genuinely do treat device
+# types differently, so if a particular streaming box works on your TV when
+# this does not, matching its type is a cheap thing to try.
+DEVICE_TYPE="playback"
+
+# CEC version to advertise: 1.4 or 2.0. Some TVs take a different code path
+# for 2.0 devices; 1.4 is the safer default and what most sources still claim.
+CEC_VERSION="1.4"
+
+# Optional 24-bit vendor ID to advertise, decimal. Empty means "unknown", which
+# is what almost every PC reports. Some TVs unlock vendor-specific behaviour for
+# IDs they recognise. Rarely needed; here because it costs nothing to expose.
+VENDOR_ID=""
+
+
+# --- what a wake is allowed to do --------------------------------------------
+#
+# A wake surveys the bus first and then sends only the frames the answers say
+# are missing. These switches say which frames it is allowed to consider at all.
+# Turning one off means "never send this", not "send it anyway".
+
+# Send <Image View On> when the TV is asleep. Off means the TV is never woken,
+# only switched - useful if something else already handles power.
+WAKE_TV=1
+
+# Send <Active Source> when the TV is showing something other than us. This is
+# the frame that switches the TV's input to this PC.
+CLAIM_SOURCE=1
+
+# Ask a receiver to power on and take the audio, but only when one actually
+# answers on the bus. With no receiver present, nothing is sent and nothing
+# fails.
+WAKE_AUDIO=1
+
+# Also send <Set Stream Path> before claiming the source. Off by default: it is
+# normally the TV's job to send this, and most TVs act on <Active Source> alone.
+# Turn it on for a TV that ignores the source claim.
+SEND_STREAM_PATH=0
+
+# Also send a remote-control power keypress (<User Control Pressed> power-on)
+# before the standard wake. Off by default. Turn it on for a TV that ignores
+# <Image View On> from devices it does not recognise but obeys its own remote.
+SEND_REMOTE_POWER_KEY=0
+
+
+# --- what a standby is allowed to do -----------------------------------------
+
+# Send <Standby> to the TV on suspend, shutdown and reboot.
+STANDBY_TV=1
+
+# Also send <Standby> to a receiver, when one is present.
+STANDBY_AUDIO=1
+
+# Send one broadcast <Standby> instead of addressing devices individually. This
+# sleeps everything on the HDMI bus, including devices that are not yours and
+# that somebody else may be watching. Off by default for that reason.
+STANDBY_BROADCAST=0
+
+
+# --- decide, or just send ----------------------------------------------------
+
+# 1 = skip the survey and send every enabled frame every time, the way this
+# project behaved before it learned to ask questions. Useful as a fallback if
+# your TV answers queries dishonestly - some report "on" while displaying
+# nothing. Costs you the "already on, nothing to do" fast path.
+FORCE_ALL_FRAMES=0
+
+
+# --- timing ------------------------------------------------------------------
+
+# Milliseconds between consecutive frames. A TV that has just powered on can
+# drop messages that arrive back to back. 0 sends them as fast as the bus
+# allows. This used to be a full second because each message was a separate
+# process; frames go out on one open connection, so 100ms is plenty.
+FRAME_GAP_MS=100
+
+# How long to wait for an answer to a question such as <Give Device Power
+# Status>. A TV that is waking up can be slow to reply.
+REPLY_TIMEOUT_MS=1200
+
+# How many times to survey, send and retry before giving up. Attempts 2 and 3
+# re-claim the logical address between tries; attempt 4 and up force the display
+# connector to re-probe, which can blank the screen for a moment.
+WAKE_ATTEMPTS=5
+
+# How long to let the TV settle before asking whether it woke up. This only
+# affects the confirmation line in the log - a wake the TV acknowledged is never
+# downgraded to a failure because the confirmation came back empty.
+WAKE_SETTLE_MS=1500
+
+
+# --- escape hatches ----------------------------------------------------------
+#
+# Extra frames appended to a plan, for TVs that want something this project does
+# not send. Semicolon-separated. Entries may be symbolic:
+#
+#   image-view-on               text-view-on
+#   active-source               inactive-source
+#   set-stream-path             system-audio-mode-request
+#   user-control-pressed=power-on   (also: power, power-off, power-toggle)
+#   user-control-released
+#   standby         standby=audio        standby=broadcast
+#
+# ...or raw bytes, for anything with no name here - vendor-specific commands
+# above all. The first byte's initiator nibble is replaced with our real logical
+# address, so only the destination nibble in it matters:
+#
+#   raw:40:44:6D                <User Control Pressed> power-on, to the TV
+#
+# These are always best effort: nothing here can turn an otherwise successful
+# wake into a failure.
+EXTRA_WAKE_FRAMES=""
+EXTRA_STANDBY_FRAMES=""
 
 
 # --- controller watcher ------------------------------------------------------
+#
+# These are the keys that need a service restart after editing.
 
 # Ignore further Home-button presses for this many seconds after one fires.
 # Also covers the duplicate events you get when Steam mirrors a physical pad
@@ -66,13 +151,13 @@ COOLDOWN_SECONDS=2.5
 # Which button counts as "Home". Space- or comma-separated evdev key names, or
 # raw numeric codes. A device is watched if it advertises at least one of these.
 #   BTN_MODE      (316) Guide/Home/PS/Xbox button on almost every gamepad
-#   BTN_HOME            not defined by mainline Linux input-event-codes.h; kept
-#                       here for kernels/controllers that do define it, and
-#                       harmlessly ignored (with a one-line note) when they do not
+#   BTN_HOME            not defined by mainline input-event-codes.h; kept here
+#                       for kernels/controllers that do define it, and
+#                       harmlessly ignored (with a note) when they do not
 #   KEY_HOMEPAGE  (172) used by some Bluetooth pads that expose Home on a
 #                       separate keyboard-ish input node
-# Run "sudo /etc/cec-hdmi/cec-controller-watch.py --monitor" and press your
-# button to find out what your controller actually sends.
+# Run "sudo /etc/cec-hdmi/cec-watch.py --monitor" and press your button to find
+# out what your controller actually sends.
 BUTTON_CODES="BTN_MODE BTN_HOME KEY_HOMEPAGE"
 
 # 1 = only watch devices that look like gamepads (advertise BTN_GAMEPAD/0x130).
@@ -80,8 +165,8 @@ BUTTON_CODES="BTN_MODE BTN_HOME KEY_HOMEPAGE"
 # that would otherwise be skipped.
 GAMEPAD_ONLY=0
 
-# 1 = log "would trigger" instead of actually running cec-hook.sh. Lets you test
-# button detection with no TV/CEC hardware involved.
+# 1 = log "would trigger" instead of actually running cec-hook. Lets you test
+# button detection with no TV or CEC hardware involved.
 DRY_RUN=0
 
 # Safety-net rescan interval (seconds) for hotplugged controllers. Hotplug is
@@ -93,7 +178,10 @@ RESCAN_SECONDS=5
 NOTIFY_ON_TRIGGER=0
 NOTIFY_ON_FAILURE=1
 
-# Log size cap. Each log is rotated to .1 .. .N once it reaches LOG_MAX_BYTES.
+
+# --- logs --------------------------------------------------------------------
+
+# Each log is rotated to .1 .. .N once it reaches LOG_MAX_BYTES.
 # Set LOG_MAX_BYTES=0 to disable rotation entirely.
 LOG_MAX_BYTES=1048576
 LOG_KEEP=2

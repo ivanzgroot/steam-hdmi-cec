@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
-# install.sh - HDMI-CEC wake/standby hooks + controller Home-button wake for SteamOS
+# install.sh - HDMI-CEC TV control for SteamOS, sent as CEC frames.
 #
 # Installs, from the files next to this script:
-#   src/cec-hook.sh              -> /etc/cec-hdmi/cec-hook.sh
-#   src/cec-controller-watch.py  -> /etc/cec-hdmi/cec-controller-watch.py
-#   config/config.conf.default   -> /etc/cec-hdmi/config.conf (first install only)
-#   systemd/*.service            -> /etc/systemd/system/
+#   src/*.py                    -> /etc/cec-hdmi/
+#   config/config.conf.default  -> /etc/cec-hdmi/config.conf (first install only)
+#   systemd/*.service           -> /etc/systemd/system/
 #
 # Usage:
 #   sudo bash install.sh                     install (safe to re-run / update)
 #   sudo bash install.sh uninstall           remove everything this script installed
 #   sudo bash install.sh uninstall --purge   ...and delete /etc/cec-hdmi too
-#   sudo bash install.sh status              show service/DPCD/controller/log state
+#   sudo bash install.sh status              adapter, tunneling, bus, controllers, logs
 #   bash install.sh selftest                 run the test suite (no root, no install)
 #   bash install.sh --help                   usage
 #   bash install.sh --version                version of this repo + what is installed
@@ -29,8 +28,8 @@ VERSION_SRC="$SCRIPT_DIR/VERSION"
 TESTS_DIR="$SCRIPT_DIR/tests"
 
 CEC_DIR="/etc/cec-hdmi"
-HOOK_SCRIPT="$CEC_DIR/cec-hook.sh"
-WATCH_SCRIPT="$CEC_DIR/cec-controller-watch.py"
+HOOK_SCRIPT="$CEC_DIR/cec-hook.py"
+WATCH_SCRIPT="$CEC_DIR/cec-watch.py"
 CONFIG_FILE="$CEC_DIR/config.conf"
 CONFIG_DEFAULTS="$CEC_DIR/config.conf.default"
 VERSION_FILE="$CEC_DIR/VERSION"
@@ -39,6 +38,10 @@ CTRL_LOGFILE="$CEC_DIR/cec-controller.log"
 UNIT_DIR="/etc/systemd/system"
 
 SERVICES="cec-hdmi-power cec-hdmi-sleep cec-hdmi-resume cec-hdmi-controller"
+
+# Entry points get the executable bit; the modules beside them are imported and
+# do not.
+ENTRY_POINTS="cec-hook.py cec-watch.py"
 
 VERSION="$(cat "$VERSION_SRC" 2>/dev/null || echo "unknown")"
 
@@ -49,30 +52,32 @@ install.sh $VERSION - HDMI-CEC TV control for SteamOS
   sudo bash install.sh                    install or update (idempotent)
   sudo bash install.sh uninstall          remove services and unit files
   sudo bash install.sh uninstall --purge  also delete $CEC_DIR (scripts, config, logs)
-  sudo bash install.sh status             services, DPCD state, controllers, recent logs
+  sudo bash install.sh status             adapter, tunneling, bus, controllers, logs
   bash install.sh selftest                run the test suite (no root, changes nothing)
   bash install.sh --help                  this text
   bash install.sh --version               repo version and installed version
 
 What gets installed
   $HOOK_SCRIPT
-      Wakes the TV and claims this PC as the active HDMI source ("on"), or sends
-      standby ("off"). Includes the DPCD 0x3001 CEC-tunneling re-enable fix that
-      post-suspend wakes depend on. Run it by hand to test:
-          sudo bash $HOOK_SCRIPT on
-          sudo bash $HOOK_SCRIPT off
-          sudo bash $HOOK_SCRIPT dpcd-status
+      Surveys the CEC bus, works out the smallest set of frames that will get
+      the TV on and showing this PC, and sends those. Includes the DisplayPort
+      DPCD 0x3001 tunneling fix that post-suspend wakes depend on.
+          sudo $HOOK_SCRIPT on
+          sudo $HOOK_SCRIPT on --dry-run    decide, print, send nothing
+          sudo $HOOK_SCRIPT off
+          sudo $HOOK_SCRIPT status
+          sudo $HOOK_SCRIPT scan            what else is on the bus
 
   $WATCH_SCRIPT
       Long-running watcher. Any connected controller's Home/Guide button runs
-      "cec-hook.sh on". Hotplug-aware, multi-controller, debounced. Standard
+      "cec-hook.py on". Hotplug-aware, multi-controller, debounced. Standard
       library only - no evdev/pyudev/pip needed.
           sudo $WATCH_SCRIPT --detect    list devices, show which are watched
           sudo $WATCH_SCRIPT --monitor   print key events live (find your button)
 
   $CONFIG_FILE
-      The cec-ctl wake/standby/audio command lists, cooldown, trigger button
-      codes, dry-run, notifications, log caps.
+      Which frames a wake and a standby may send, the adapter identity, timing,
+      trigger button codes, dry-run, notifications, log caps.
       Written with defaults on first install and NEVER overwritten afterwards;
       current defaults are always mirrored to $CONFIG_DEFAULTS for reference.
       Edit it, then: sudo systemctl restart cec-hdmi-controller.service
@@ -93,10 +98,18 @@ USAGE_EOF
 
 # Everything this installer copies out. Checked up front so a partial or
 # stripped-down copy of the repo fails with a clear message instead of a
-# half-finished install.
+# half-finished install. tests/test_packaging.py asserts this list against the
+# contents of src/ and systemd/, so a new file that is never copied is caught
+# before it ships rather than after.
 PAYLOAD="
-$SRC_DIR/cec-hook.sh
-$SRC_DIR/cec-controller-watch.py
+$SRC_DIR/cec_frames.py
+$SRC_DIR/cec_device.py
+$SRC_DIR/cec_dpcd.py
+$SRC_DIR/cec_config.py
+$SRC_DIR/cec_control.py
+$SRC_DIR/cec_log.py
+$SRC_DIR/cec-hook.py
+$SRC_DIR/cec-watch.py
 $CONFIG_SRC
 $VERSION_SRC
 $UNIT_SRC_DIR/cec-hdmi-power.service
@@ -151,8 +164,8 @@ case "$ACTION" in
         ;;
 esac
 
-# Needs no privileges, so check it before asking for a password - being told
-# the files are missing is more useful than being told it after authenticating.
+# Needs no privileges, so check it before asking for a password - being told the
+# files are missing is more useful than being told it after authenticating.
 if [ "$ACTION" = "install" ]; then
     check_payload
 fi
@@ -163,28 +176,29 @@ if [ "$ACTION" != "status" ] && [ "$ACTION" != "selftest" ] && [ "$(id -u)" -ne 
 fi
 
 install_all() {
-    if ! command -v cec-ctl >/dev/null 2>&1; then
-        echo "ERROR: cec-ctl not found (package: v4l-utils). Install it first." >&2
-        exit 1
-    fi
-
     if ! command -v python3 >/dev/null 2>&1; then
         echo "ERROR: python3 not found. It ships with SteamOS - something is wrong." >&2
         exit 1
     fi
 
-    # The watcher deliberately uses only the Python standard library (raw
-    # /dev/input/event* reads + sysfs + a netlink uevent socket) instead of
-    # python-evdev/pyudev. SteamOS has a read-only root with no compiler and an
-    # unpopulated pacman keyring, so "pip install evdev" (a C extension) is the
-    # single most likely thing to break a one-command install. Nothing to
-    # install here, and no venv to keep in sync.
-    echo "==> Using system python3: $(python3 --version 2>&1) (no extra packages needed)"
+    # Nothing else is required. CEC is spoken directly to /dev/cec0 through the
+    # kernel's ioctl interface, so there is no cec-ctl and no v4l-utils to
+    # install; and the watcher reads /dev/input and a netlink socket with the
+    # standard library, so there is no evdev, no pyudev, no pip and no venv.
+    # That matters on SteamOS, where the root filesystem is read-only, there is
+    # no compiler, and "pip install" is the single most likely thing to break a
+    # one-command install.
+    echo "==> Using system python3: $(python3 --version 2>&1) (no other dependencies)"
 
-    echo "==> Installing scripts into $CEC_DIR"
+    echo "==> Installing into $CEC_DIR"
     install -d -m 0755 "$CEC_DIR"
-    install -m 0755 "$SRC_DIR/cec-hook.sh" "$HOOK_SCRIPT"
-    install -m 0755 "$SRC_DIR/cec-controller-watch.py" "$WATCH_SCRIPT"
+    for f in "$SRC_DIR"/*.py; do
+        name="$(basename "$f")"
+        case " $ENTRY_POINTS " in
+            *" $name "*) install -m 0755 "$f" "$CEC_DIR/$name" ;;
+            *)           install -m 0644 "$f" "$CEC_DIR/$name" ;;
+        esac
+    done
 
     echo "==> Installing $CONFIG_DEFAULTS (reference copy of shipped defaults)"
     install -m 0644 "$CONFIG_SRC" "$CONFIG_DEFAULTS"
@@ -206,7 +220,7 @@ install_all() {
     echo "==> Reloading systemd"
     systemctl daemon-reload
 
-    echo "==> Enabling cec-hdmi-power.service and running the wake sequence now"
+    echo "==> Enabling cec-hdmi-power.service and running a wake now"
     systemctl enable cec-hdmi-power.service
     systemctl restart cec-hdmi-power.service
 
@@ -228,6 +242,9 @@ install_all() {
     for unit in $SERVICES; do
         echo "  $UNIT_DIR/$unit.service"
     done
+    echo
+    echo "Devices on the CEC bus:"
+    "$HOOK_SCRIPT" scan 2>&1 | sed 's/^/  /' || true
     echo
     echo "Controllers seen right now:"
     "$WATCH_SCRIPT" --detect 2>&1 | sed -n '/^\/dev\/input/,$p' | sed 's/^/  /' || true
@@ -289,9 +306,9 @@ status_all() {
     done
     echo
 
-    echo "==> DP->HDMI dongle CEC tunneling (DPCD 0x3001)"
+    echo "==> Adapter, tunneling and bus"
     if [ -x "$HOOK_SCRIPT" ]; then
-        "$HOOK_SCRIPT" dpcd-status 2>&1 | sed 's/^/  /' || true
+        "$HOOK_SCRIPT" status 2>&1 | sed 's/^/  /' || true
     else
         echo "  $HOOK_SCRIPT not installed"
     fi
@@ -317,7 +334,7 @@ status_all() {
 }
 
 selftest() {
-    if [ ! -x "$TESTS_DIR/run.sh" ] && [ ! -f "$TESTS_DIR/run.sh" ]; then
+    if [ ! -f "$TESTS_DIR/run.sh" ]; then
         echo "ERROR: $TESTS_DIR/run.sh not found (run from a full clone)" >&2
         exit 1
     fi

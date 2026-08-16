@@ -4,7 +4,9 @@ Before=sleep.target
 
 [Service]
 Type=oneshot
-ExecStart=/etc/cec-hdmi/cec-hook.sh off
+ExecStart=/etc/cec-hdmi/cec-hook.py off
+# This unit is holding up the suspend, so the standby path deliberately asks the
+# bus nothing it does not have to. See Controller.plan_standby.
 TimeoutStartSec=15
 
 [Install]

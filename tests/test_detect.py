@@ -7,9 +7,21 @@ import sys
 import tempfile
 from contextlib import redirect_stdout
 
-from _harness import Checks, load_daemon, mask_for
+from _harness import Checks, load_watcher, mask_for
 
-w = load_daemon()
+import cec_config
+
+w = load_watcher()
+
+
+def _run_detect(path):
+    """run_detect now takes the resolved trigger codes rather than digging them
+    out of the config itself, so the two callers cannot disagree about which
+    codes are live."""
+    config = cec_config.Config(path)
+    codes, unknown = config.button_codes(w.KEY_NAMES)
+    return w.run_detect(config, codes, unknown)
+
 check = Checks()
 
 root = tempfile.mkdtemp()
@@ -75,7 +87,7 @@ with open(cfgpath, "w") as fh:
 
 buf = io.StringIO()
 with redirect_stdout(buf):
-    rc = w.run_detect(w.Config(cfgpath))
+    rc = _run_detect(cfgpath)
 out = buf.getvalue()
 
 check("exit 0 when something is watched", rc, 0)
@@ -92,7 +104,7 @@ with open(cfgpath, "w") as fh:
     fh.write('BUTTON_CODES="BTN_MODE KEY_HOMEPAGE"\nGAMEPAD_ONLY=1\n')
 buf = io.StringIO()
 with redirect_stdout(buf):
-    w.run_detect(w.Config(cfgpath))
+    _run_detect(cfgpath)
 out = buf.getvalue()
 check("gamepad-only narrows to real pads", "5 input device(s), 2 watched." in out, True)
 check("explains why the keyboard was dropped", "GAMEPAD_ONLY=1" in out, True)
@@ -102,7 +114,7 @@ with open(cfgpath, "w") as fh:
     fh.write('BUTTON_CODES="BTN_TRIGGER_HAPPY"\n')
 buf = io.StringIO()
 with redirect_stdout(buf):
-    rc = w.run_detect(w.Config(cfgpath))
+    rc = _run_detect(cfgpath)
 out = buf.getvalue()
 check("exit 1 when nothing would trigger", rc, 1)
 check("suggests --monitor", "--monitor" in out, True)
@@ -113,7 +125,7 @@ empty = tempfile.mkdtemp()
 w.SYS_INPUT = empty
 buf = io.StringIO()
 with redirect_stdout(buf):
-    rc = w.run_detect(w.Config(cfgpath))
+    rc = _run_detect(cfgpath)
 check("exit 1 with no devices", rc, 1)
 check("says so", "No input devices found" in buf.getvalue(), True)
 w.SYS_INPUT = sysdir

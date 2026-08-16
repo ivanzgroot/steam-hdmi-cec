@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs every test suite plus syntax checks on the shell payload.
+# Runs every test suite, plus syntax checks on everything that ships.
 # No root, no install, nothing outside a temp directory is touched.
 #
 #   bash tests/run.sh          quiet: one line per suite
@@ -34,7 +34,7 @@ run() {
     local label="$1"
     shift
     total=$((total + 1))
-    printf '%-34s ' "$label"
+    printf '%-38s ' "$label"
     local output status
     output="$("$@" 2>&1)"
     status=$?
@@ -65,18 +65,26 @@ for suite in "$TESTS_DIR"/test_*.py; do
 done
 
 run "install.sh syntax" bash -n "$REPO_ROOT/install.sh"
-run "src/cec-hook.sh syntax" bash -n "$REPO_ROOT/src/cec-hook.sh"
-# compile() rather than py_compile: same syntax check, but it does not leave a
-# __pycache__ directory sitting in src/.
-run "src/cec-controller-watch.py compiles" "$PYTHON" -c \
-    'import sys; compile(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1], "exec")' \
-    "$REPO_ROOT/src/cec-controller-watch.py"
-run "config.conf.default is sourceable" \
-    bash -c 'set -u; . "$1"
-             [ -n "${COOLDOWN_SECONDS}${BUTTON_CODES}${LOG_MAX_BYTES}" ] &&
-             [ -n "${CEC_WAKE_COMMANDS}${CEC_STANDBY_COMMANDS}${CEC_COMMAND_DELAY}" ] &&
-             [ -n "${CEC_AUDIO_COMMANDS}" ]' \
-    _ "$REPO_ROOT/config/config.conf.default"
+
+# compile() rather than py_compile: the same syntax check, but it does not leave
+# a __pycache__ directory sitting in src/.
+for source in "$REPO_ROOT"/src/*.py; do
+    run "$(basename "$source") compiles" "$PYTHON" -B -c \
+        'import sys; compile(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1], "exec")' \
+        "$source"
+done
+
+# The config is no longer sourced by bash, so what matters is that the shipped
+# defaults parse with the project's own parser and produce a usable Config.
+run "config.conf.default is loadable" "$PYTHON" -B -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+import cec_config
+config = cec_config.Config(sys.argv[2])
+assert not config.problems, config.problems
+assert config.osd_name and config.device and config.wake_attempts >= 1
+assert config.cooldown >= 0 and config.log_keep >= 0
+' "$REPO_ROOT/src" "$REPO_ROOT/config/config.conf.default"
 
 echo
 if [ "$failed" -ne 0 ]; then

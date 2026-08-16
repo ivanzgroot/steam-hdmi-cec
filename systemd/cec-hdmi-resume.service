@@ -7,7 +7,10 @@ After=systemd-suspend-then-hibernate.service
 
 [Service]
 Type=oneshot
-ExecStart=/etc/cec-hdmi/cec-hook.sh on
+ExecStart=/etc/cec-hdmi/cec-hook.py on
+# The DisplayPort tunneling bit is always clear at this point, so this is the
+# path the whole project exists for. Generous timeout: re-enabling tunneling and
+# escalating through a connector re-probe can take a while.
 TimeoutStartSec=150
 
 [Install]

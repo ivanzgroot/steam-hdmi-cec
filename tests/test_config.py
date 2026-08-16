@@ -1,139 +1,158 @@
-"""Config parsing, sysfs bitmask decoding, key-name resolution, log rotation."""
+"""Config parsing and log rotation.
+
+The config used to be read by two languages at once - sourced by bash and parsed
+by Python - which meant every default was written twice and kept in step by a
+test. It is now read here and nowhere else, so these checks are about parsing
+being tolerant rather than about two implementations agreeing.
+
+Tolerant is the requirement. A typo in this file must never stop the TV coming
+on: bad values fall back to their defaults, record a problem, and the wake
+proceeds.
+"""
 
 import os
-import struct
 import sys
 import tempfile
 
-from _harness import Checks, load_daemon
+from _harness import Checks
 
-w = load_daemon()
+import cec_config
+import cec_log
+
 check = Checks()
-
-check.section("struct layout")
-# On the target (Linux x86_64) long is 8 bytes, so input_event is 24 bytes.
-check("input_event size for LP64", struct.calcsize("=qqHHi"), 24)
-check("EVENT_FMT follows the native long",
-      w.EVENT_SIZE, struct.calcsize("l") * 2 + 8)
-check("LONG_BITS follows the native long", w.LONG_BITS, struct.calcsize("l") * 8)
-
-
-def bits_of(value, base=0):
-    return {base + i for i in range(value.bit_length()) if (value >> i) & 1}
-
-
-check.section("parse_bitmap (kernel writes %lx per word, MSW first, unpadded)")
-# BTN_MODE = 0x13c = 316 -> word 4 (316//64), bit 60 (316%64)
-check("BTN_MODE only", w.parse_bitmap("1000000000000000 0 0 0 0", 64), {316})
-# Regression: an 8-hex-char lower word must NOT be read as 32-bit words. Real
-# masks look exactly like this because the kernel formats them with "%lx".
-mixed = "1000000000000000 0 0 7cdb0000 0"
-check("unpadded lower word keeps 64-bit scale",
-      w.parse_bitmap(mixed, 64), {316} | bits_of(0x7CDB0000, 64))
-check("not misread as 32-bit words", 188 in w.parse_bitmap(mixed, 64), False)
-check("empty", w.parse_bitmap("", 64), set())
-check("single word", w.parse_bitmap("d", 64), {0, 2, 3})
-# KEY_HOMEPAGE = 172 -> word 2, bit 44
-check("KEY_HOMEPAGE 172", w.parse_bitmap("100000000000 0 0", 64), {172})
-check("garbage word skipped", w.parse_bitmap("zz 1", 64), {0})
-
-check.section("key name resolution")
-check("BTN_MODE", w.KEY_NAMES.get("BTN_MODE"), 0x13C)
-check("KEY_HOMEPAGE", w.KEY_NAMES.get("KEY_HOMEPAGE"), 172)
-check("BTN_HOME absent from mainline codes", "BTN_HOME" in w.KEY_NAMES, False)
-check("code_name(316)", w.code_name(316), "BTN_MODE")
-check("code_name(172)", w.code_name(172), "KEY_HOMEPAGE")
-check("code_name unknown", w.code_name(9999), "code_9999")
-check("fmt_codes", w.fmt_codes([316, 172]), "BTN_MODE(316), KEY_HOMEPAGE(172)")
-check("fmt_codes empty", w.fmt_codes([]), "none")
-
-check.section("header augmentation (aliases resolve)")
 scratch = tempfile.mkdtemp()
-header = os.path.join(scratch, "input-event-codes.h")
-with open(header, "w") as fh:
-    fh.write(
-        "#define KEY_RESERVED 0\n"
-        "#define BTN_SOUTH\t\t0x130\n"
-        "#define BTN_A\t\t\tBTN_SOUTH\n"
-        "#define BTN_MODE\t\t0x13c\n"
-        "#define KEY_FANCY_NEW\t\t0x2f0  /* trailing comment */\n"
-        "#define KEY_MAX\t\t\t0x2ff\n"
-        "#define KEY_CNT\t\t\t(KEY_MAX+1)\n"
-        "#define SOMETHING_ELSE\t\t5\n"
-    )
-saved = w.KERNEL_CODE_HEADER
-w.KERNEL_CODE_HEADER = header
-names = w.load_key_names()
-w.KERNEL_CODE_HEADER = saved
-check("header adds new code", names.get("KEY_FANCY_NEW"), 0x2F0)
-check("alias resolved", names.get("BTN_A"), 0x130)
-check("_MAX skipped", "KEY_MAX" in names, False)
-check("_CNT skipped", "KEY_CNT" in names, False)
-check("non KEY/BTN ignored", "SOMETHING_ELSE" in names, False)
-check("base entries survive", names.get("KEY_HOMEPAGE"), 172)
-check("missing header is not fatal", isinstance(w.load_key_names(), dict), True)
 
-check.section("config parsing")
-cfgpath = os.path.join(scratch, "test.conf")
-with open(cfgpath, "w") as fh:
-    fh.write(
-        "# a comment\n"
-        "\n"
-        "COOLDOWN_SECONDS=3.5\n"
-        'BUTTON_CODES="BTN_MODE BTN_HOME KEY_HOMEPAGE"\n'
-        "GAMEPAD_ONLY=0\n"
-        "DRY_RUN=yes\n"
-        "LOG_MAX_BYTES=2048   # inline comment\n"
-        "export LOG_KEEP=3\n"
-        "NOTIFY_ON_FAILURE='1'\n"
-        "this line is not an assignment\n"
-        "RESCAN_SECONDS=banana\n"
-    )
-cfg = w.Config(cfgpath)
-check("float value", cfg.cooldown, 3.5)
-check("bool yes", cfg.dry_run, True)
-check("bool 0", cfg.gamepad_only, False)
-check("single-quoted bool", cfg.notify_on_failure, True)
-check("inline comment stripped", cfg.log_max_bytes, 2048)
-check("export prefix", cfg.log_keep, 3)
-check("bad number falls back to default", cfg.rescan, float(w.DEFAULTS["RESCAN_SECONDS"]))
-check("trigger codes resolved", cfg.trigger_codes, {316, 172})
-check("BTN_HOME reported unknown, not fatal", cfg.unknown_codes, ["BTN_HOME"])
-check("problems recorded", any("banana" in p for p in cfg.problems), True)
 
-check.section("config edge cases")
-with open(cfgpath, "w") as fh:
-    fh.write("BUTTON_CODES='0x13c, 172,BTN_START'\nCOOLDOWN_SECONDS=-5\n")
-cfg2 = w.Config(cfgpath)
-check("numeric + comma separated + name", cfg2.trigger_codes, {316, 172, 0x13B})
-check("negative cooldown clamped", cfg2.cooldown, 0.0)
+def write_config(text, name="test.conf"):
+    path = os.path.join(scratch, name)
+    with open(path, "w") as handle:
+        handle.write(text)
+    return path
 
-with open(cfgpath, "w") as fh:
-    fh.write("BUTTON_CODES='NONSENSE_ONLY'\n")
-check("unresolvable codes fall back to BTN_MODE", w.Config(cfgpath).trigger_codes, {316})
 
-missing = w.Config(os.path.join(scratch, "definitely-missing.conf"))
-check("missing config uses defaults", missing.cooldown, 2.5)
-check("missing config still has trigger codes", missing.trigger_codes, {316, 172})
+check.section("basic parsing")
+path = write_config(
+    "# a comment\n"
+    "\n"
+    "COOLDOWN_SECONDS=3.5\n"
+    'OSD_NAME="Living Room"\n'
+    "GAMEPAD_ONLY=0\n"
+    "DRY_RUN=yes\n"
+    "LOG_MAX_BYTES=2048   # inline comment\n"
+    "export LOG_KEEP=3\n"
+    "NOTIFY_ON_FAILURE='1'\n"
+    "this line is not an assignment\n"
+    "RESCAN_SECONDS=banana\n"
+)
+config = cec_config.Config(path)
+check("float value", config.cooldown, 3.5)
+check("double-quoted string with a space", config.osd_name, "Living Room")
+check("yes is true", config.dry_run, True)
+check("0 is false", config.gamepad_only, False)
+check("single-quoted bool", config.notify_on_failure, True)
+check("inline comment stripped", config.log_max_bytes, 2048)
+check("export prefix accepted", config.log_keep, 3)
+check("bad number falls back to the default",
+      config.rescan, float(cec_config.DEFAULTS["RESCAN_SECONDS"]))
+check("the non-assignment line is reported",
+      any("not a KEY=VALUE" in p for p in config.problems), True)
+check("the bad number is reported",
+      any("banana" in p for p in config.problems), True)
 
-check.section("logger rotation")
+check.section("quoting")
+path = write_config(
+    'EXTRA_WAKE_FRAMES="image-view-on; active-source"\n'
+    "OSD_NAME=Bare\n"
+    'VENDOR_ID=""\n'
+)
+config = cec_config.Config(path)
+check("semicolons survive quoting",
+      config.extra_wake_frames, "image-view-on; active-source")
+check("unquoted values work", config.osd_name, "Bare")
+check("an empty quoted value is empty", config.vendor_id, "")
+
+# The old parser took the first closing quote it found, so a value merely
+# containing a quote was silently truncated. Only a matched pair counts now.
+path = write_config('OSD_NAME=say "hi" there\n')
+check("a value containing quotes is not truncated",
+      cec_config.Config(path).osd_name, 'say "hi" there')
+
+check.section("clamping keeps nonsense out of the wake path")
+path = write_config(
+    "COOLDOWN_SECONDS=-5\n"
+    "FRAME_GAP_MS=999999\n"
+    "WAKE_ATTEMPTS=0\n"
+    "REPLY_TIMEOUT_MS=1\n"
+)
+config = cec_config.Config(path)
+check("negative cooldown clamps to zero", config.cooldown, 0.0)
+check("an absurd frame gap clamps to the maximum", config.frame_gap_ms, 5000)
+check("zero attempts clamps to one", config.wake_attempts, 1)
+check("a tiny reply timeout clamps to the minimum", config.reply_timeout_ms, 100)
+check("every clamp is reported", len(config.problems) >= 4, True)
+
+check.section("booleans")
+for text, expected in (("1", True), ("yes", True), ("true", True), ("on", True),
+                       ("0", False), ("no", False), ("false", False),
+                       ("off", False), ("", False)):
+    path = write_config("WAKE_TV=%s\n" % text)
+    check("WAKE_TV=%r" % text, cec_config.Config(path).wake_tv, expected)
+
+path = write_config("WAKE_TV=maybe\n")
+config = cec_config.Config(path)
+check("a nonsense boolean falls back to the default", config.wake_tv, True)
+check("and says so", any("yes/no" in p for p in config.problems), True)
+
+check.section("a missing config is not an error")
+config = cec_config.Config(os.path.join(scratch, "definitely-missing.conf"))
+check("defaults are used", config.cooldown, 2.5)
+check("the wake still knows what to do", config.wake_tv, True)
+check("the receiver is still handled", config.wake_audio, True)
+check("it is reported once", len(config.problems), 1)
+
+check.section("unknown keys are kept, not dropped")
+path = write_config("SOMETHING_FUTURE=42\nWAKE_TV=1\n")
+config = cec_config.Config(path)
+check("an unrecognised key survives parsing", config.values.get("SOMETHING_FUTURE"), "42")
+check("and does not become a problem",
+      any("SOMETHING_FUTURE" in p for p in config.problems), False)
+
+check.section("button codes resolve against the running kernel")
+KEY_NAMES = {"BTN_MODE": 316, "KEY_HOMEPAGE": 172, "BTN_START": 0x13B}
+path = write_config('BUTTON_CODES="BTN_MODE BTN_HOME KEY_HOMEPAGE"\n')
+codes, unknown = cec_config.Config(path).button_codes(KEY_NAMES)
+check("known names resolve", codes, {316, 172})
+check("BTN_HOME is reported, not fatal", unknown, ["BTN_HOME"])
+
+path = write_config("BUTTON_CODES='0x13c, 172,BTN_START'\n")
+codes, _ = cec_config.Config(path).button_codes(KEY_NAMES)
+check("hex, decimal and names mix freely", codes, {316, 172, 0x13B})
+
+path = write_config("BUTTON_CODES='NONSENSE_ONLY'\n")
+config = cec_config.Config(path)
+codes, unknown = config.button_codes(KEY_NAMES)
+check("unresolvable codes fall back to BTN_MODE", codes, {316})
+check("the fallback is reported",
+      any("resolved to nothing" in p for p in config.problems), True)
+
+check.section("log rotation")
 logpath = os.path.join(scratch, "t.log")
-log = w.Logger(logpath, max_bytes=200, keep=2, echo=False)
-for i in range(60):
-    log("line %03d padded out to force rotation" % i)
+log = cec_log.Logger(logpath, max_bytes=200, keep=2, echo=False)
+for index in range(60):
+    log("line %03d padded out to force rotation" % index)
 check(".1 exists", os.path.exists(logpath + ".1"), True)
 check(".2 exists", os.path.exists(logpath + ".2"), True)
 check(".3 does not (keep=2)", os.path.exists(logpath + ".3"), False)
 # Rotation is check-then-write, so the live log may overshoot by the one line
 # that crossed the cap - bounded, which is all a size cap needs to be.
-check("live log bounded near cap", os.path.getsize(logpath) < 400, True)
-with open(logpath) as fh:
-    check("timestamp+tag format", fh.readline()[:1].isdigit(), True)
+check("the live log stays bounded near the cap", os.path.getsize(logpath) < 400, True)
+with open(logpath) as handle:
+    check("lines start with a timestamp", handle.readline()[:1].isdigit(), True)
 
 nolog = os.path.join(scratch, "u.log")
-log2 = w.Logger(nolog, max_bytes=0, keep=2, echo=False)
-for i in range(60):
-    log2("line %03d padded out, rotation disabled" % i)
+log = cec_log.Logger(nolog, max_bytes=0, keep=2, echo=False)
+for index in range(60):
+    log("line %03d padded out, rotation disabled" % index)
 check("max_bytes=0 disables rotation", os.path.exists(nolog + ".1"), False)
 
 sys.exit(check.finish())
