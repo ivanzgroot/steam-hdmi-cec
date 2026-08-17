@@ -77,6 +77,95 @@ result = device.transmit(f.image_view_on(4))
 check("the frame reached the bus", adapter.sent[-1].hex(), "40:04")
 check("the TV acknowledged", result.ok, True)
 
+check.section("claiming an address on an adapter that already has one")
+# The bug that broke the first real install. The kernel's drm_dp_cec driver
+# claims a logical address when it reads the EDID, so by the time this project
+# opens /dev/cec0 the adapter is normally already configured - and
+# CEC_ADAP_S_LOG_ADDRS on a configured adapter returns EBUSY. Going straight
+# from configured to configured is not allowed.
+
+# Already configured exactly as we want it: adopt it, write nothing.
+adapter = FakeAdapter(devices={f.LA_TV: {}},
+                      configured={"osd_name": "SteamOS", "version": 5, "primary": 4})
+device = adapter.device()
+check("the existing address is adopted",
+      device.configure(osd_name="SteamOS", device_type="playback"), 4)
+check("and nothing was written", adapter.configured, 0)
+check("and it says so", device.adopted_existing, True)
+check("no clear was issued either",
+      [c for c in adapter.calls if c[0] == "clear"], [])
+
+# Configured with a different identity: must be cleared, then set.
+adapter = FakeAdapter(devices={f.LA_TV: {}},
+                      configured={"osd_name": "SomethingElse", "version": 5,
+                                  "primary": 4})
+device = adapter.device()
+check("a different OSD name forces a re-claim",
+      device.configure(osd_name="SteamOS", device_type="playback"), 4)
+check("the adapter was cleared first",
+      [c[0] for c in adapter.calls if c[0] in ("clear", "configure")],
+      ["clear", "configure"])
+check("and this was a real claim", device.adopted_existing, False)
+
+# A different device type is also a real change.
+adapter = FakeAdapter(devices={f.LA_TV: {}},
+                      configured={"osd_name": "SteamOS", "version": 5, "primary": 4})
+device = adapter.device()
+device.configure(osd_name="SteamOS", device_type="tuner")
+check("a different device type forces a re-claim",
+      [c[0] for c in adapter.calls if c[0] in ("clear", "configure")],
+      ["clear", "configure"])
+
+# A different CEC version likewise.
+adapter = FakeAdapter(devices={f.LA_TV: {}},
+                      configured={"osd_name": "SteamOS", "version": 5, "primary": 4})
+device = adapter.device()
+device.configure(osd_name="SteamOS", cec_version="2.0")
+check("a different CEC version forces a re-claim",
+      [c[0] for c in adapter.calls if c[0] in ("clear", "configure")],
+      ["clear", "configure"])
+
+# Unconfigured: straight to a claim, no pointless clear.
+adapter = FakeAdapter(devices={f.LA_TV: {}}, configured=None)
+device = adapter.device()
+check("an unconfigured adapter is claimed directly", device.configure(), 4)
+check("with no clear first",
+      [c[0] for c in adapter.calls if c[0] in ("clear", "configure")], ["configure"])
+
+# force=True re-claims even when the configuration already matches.
+adapter = FakeAdapter(devices={f.LA_TV: {}},
+                      configured={"osd_name": "SteamOS", "version": 5, "primary": 4})
+device = adapter.device()
+device.configure(osd_name="SteamOS", force=True)
+check("force=True re-claims regardless",
+      [c[0] for c in adapter.calls if c[0] in ("clear", "configure")],
+      ["clear", "configure"])
+
+check.section("ioctl errors become messages, not tracebacks")
+# Under systemd an unhandled OSError is a Python traceback in the journal,
+# which says where the call was made but not what it means.
+adapter = FakeAdapter(devices={f.LA_TV: {}})
+device = adapter.device()
+
+
+def explode(_request, _payload):
+    raise OSError(16, "Device or resource busy")
+
+
+device._ioctl = explode
+try:
+    device.read_phys_addr()
+    raised = "nothing"
+except d.CecError as exc:
+    raised = "CecError"
+    message = str(exc)
+except OSError:
+    raised = "OSError"
+    message = ""
+check("a failed ioctl raises CecError", raised, "CecError")
+check("the message names the operation", "physical address" in message, True)
+check("and carries the errno", "errno 16" in message, True)
+
 check.section("polling is how devices are discovered")
 adapter = FakeAdapter(devices={f.LA_TV: {}, f.LA_AUDIOSYSTEM: {}})
 device = adapter.device()

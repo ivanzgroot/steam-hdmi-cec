@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from cec_config import CEC_DIR, Config, DEFAULT_CONFIG          # noqa: E402
 from cec_control import Controller                              # noqa: E402
-from cec_device import CecError                                 # noqa: E402
+from cec_device import CecDevice, CecError                      # noqa: E402
 from cec_dpcd import DpcdTunneling                              # noqa: E402
 from cec_log import Logger                                      # noqa: E402
 
@@ -50,26 +50,56 @@ def build_parser():
 
 
 def run_status(config, log):
-    """Read-only. Deliberately works even when the adapter cannot be opened,
-    because "the adapter cannot be opened" is exactly what you want it to say."""
+    """Read-only diagnostics, reported in layers.
+
+    Each layer is printed before the next is attempted, so a failure half way
+    down still leaves everything above it on screen. "The adapter exists, holds
+    address 4, and tunneling is off" is a diagnosis; a single line saying the
+    wake failed is not.
+    """
     print("cec-hook %s" % VERSION)
     print("config:  %s" % config.path)
+    for problem in config.problems:
+        print("  note:  %s" % problem)
     print()
 
     if not os.path.exists(config.device):
         print("adapter: %s does not exist" % config.device)
+        print("         the CEC adapter has not been created - check that the")
+        print("         display is connected and that the kernel probed it")
         return 1
 
+    device = None
+    try:
+        device = CecDevice(config.device).open()
+        print("adapter: %s" % device.describe())
+
+        info = device.log_addrs_info()
+        if info["addr"] is None and info["count"]:
+            print("logical: claiming in progress")
+        elif info["addr"] is None:
+            print("logical: unconfigured (no address claimed yet)")
+        else:
+            print("logical: %d, advertised as %r, CEC version 0x%02X"
+                  % (info["addr"], info["osd_name"], info["version"]))
+
+        tunneling = DpcdTunneling(device.name)
+        print("DPCD:    %s" % tunneling.status()[1])
+        if tunneling.connector:
+            print("display: %s is %s" % (os.path.basename(tunneling.connector),
+                                         tunneling.connector_status()))
+    except CecError as exc:
+        print("adapter: ERROR - %s" % exc)
+        if device is not None:
+            device.close()
+        return 1
+    finally:
+        if device is not None:
+            device.close()
+
+    print()
     try:
         with Controller(config, log) as controller:
-            print("adapter: %s" % controller.device.describe())
-            value, text = controller.dpcd.status()
-            print("DPCD:    %s" % text)
-            if controller.dpcd.connector:
-                print("display: %s is %s"
-                      % (os.path.basename(controller.dpcd.connector),
-                         controller.dpcd.connector_status()))
-            print()
             state = controller.survey()
             print("bus:")
             print(state.describe())
@@ -86,12 +116,7 @@ def run_status(config, log):
                 print("a wake right now would send nothing: "
                       "the TV is awake and already showing us.")
     except CecError as exc:
-        print("adapter: ERROR - %s" % exc)
-        # Still worth reporting the tunneling bit: a cleared 0x3001 is the most
-        # likely reason the adapter is unusable in the first place.
-        tunneling = DpcdTunneling("")
-        _value, text = tunneling.status()
-        print("DPCD:    %s" % text)
+        print("bus:     ERROR - %s" % exc)
         return 1
     return 0
 

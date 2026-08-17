@@ -84,7 +84,8 @@ class FakeAdapter:
     """
 
     def __init__(self, devices=None, phys_addr=0x3000, logical_addr=4,
-                 adapter_name="DP-1", active_source=None, caps=0x4):
+                 adapter_name="DP-1", active_source=None, caps=0x4,
+                 configured=None):
         import cec_device as dev
 
         self.dev = dev
@@ -94,6 +95,13 @@ class FakeAdapter:
         self.adapter_name = adapter_name
         self.active_source = active_source
         self.caps = caps
+
+        # What the adapter already holds when we arrive. The kernel's own
+        # drm_dp_cec driver claims an address when it reads the EDID, so a real
+        # adapter is usually already configured before this project opens it -
+        # and CEC_ADAP_S_LOG_ADDRS returns EBUSY on one that is. None means
+        # unconfigured; a dict means configured with those settings.
+        self.configured_state = configured
 
         self.sent = []          # every Frame handed to transmit, in order
         self.configured = 0     # how many times a logical address was claimed
@@ -116,8 +124,7 @@ class FakeAdapter:
         if request == self.dev.ADAP_S_LOG_ADDRS:
             return self._set_log_addrs(payload)
         if request == self.dev.ADAP_G_LOG_ADDRS:
-            payload[:] = self._log_addrs_blob()
-            return 0
+            return self._get_log_addrs(payload)
         if request == self.dev.TRANSMIT:
             return self._transmit(payload)
         if request == self.dev.RECEIVE:
@@ -126,22 +133,45 @@ class FakeAdapter:
 
     # -- adapter state
 
-    def _log_addrs_blob(self, count=1):
+    def _log_addrs_blob(self, count=1, state=None):
+        state = state or {}
         addr = self.logical_addr if count else 0xFF
+        name = state.get("osd_name", "SteamOS").encode()[:14]
         return struct.pack(self.dev.LOG_ADDRS_FMT,
                            bytes([addr, 0xFF, 0xFF, 0xFF]), 1 << addr if count else 0,
-                           5, count, 0xFFFFFF, 0, b"fake", b"\x04\0\0\0",
+                           state.get("version", 5), count, 0xFFFFFF, 0, name,
+                           bytes([state.get("primary", 4), 0, 0, 0]),
                            b"\x03\0\0\0", b"\x10\0\0\0", b"\0" * 48)
+
+    def _get_log_addrs(self, payload):
+        if self.configured_state is None:
+            payload[:] = self._log_addrs_blob(count=0)
+        else:
+            payload[:] = self._log_addrs_blob(count=1, state=self.configured_state)
+        return 0
 
     def _set_log_addrs(self, payload):
         fields = struct.unpack(self.dev.LOG_ADDRS_FMT, bytes(payload))
         count = fields[3]
-        if count:
-            self.configured += 1
-            self.calls.append(("configure", self.logical_addr))
-        else:
+        if not count:
             self.calls.append(("clear", None))
-        payload[:] = self._log_addrs_blob(count)
+            self.configured_state = None
+            payload[:] = self._log_addrs_blob(count=0)
+            return 0
+
+        # The kernel refuses to set logical addresses on an adapter that is
+        # already configured. Clearing first is the only legal route.
+        if self.configured_state is not None:
+            raise OSError(errno.EBUSY, "Device or resource busy")
+
+        self.configured += 1
+        self.calls.append(("configure", self.logical_addr))
+        self.configured_state = {
+            "osd_name": fields[6].split(b"\0")[0].decode(),
+            "version": fields[2],
+            "primary": fields[7][0],
+        }
+        payload[:] = self._log_addrs_blob(count=1, state=self.configured_state)
         return 0
 
     # -- frames

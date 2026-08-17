@@ -25,7 +25,7 @@ except ImportError:
     # adapter on a Windows or macOS dev box. Only real hardware needs fcntl.
     fcntl = None
 
-from cec_frames import Frame, PHYS_ADDR_INVALID, format_phys_addr
+from cec_frames import Frame, LA_INVALID, PHYS_ADDR_INVALID, format_phys_addr
 
 DEFAULT_DEVICE = "/dev/cec0"
 
@@ -136,6 +136,11 @@ CEC_VERSION_2_0 = 6
 
 CEC_VERSIONS = {"1.4": CEC_VERSION_1_4, "2.0": CEC_VERSION_2_0}
 
+# Claiming an address can collide with a claim the kernel started on its own
+# after a hotplug or a resume. Both settle in well under a second.
+S_LOG_ADDRS_RETRIES = 5
+S_LOG_ADDRS_RETRY_DELAY = 0.4
+
 
 class CecError(Exception):
     """Anything that stops us talking to the adapter at all."""
@@ -212,6 +217,10 @@ class CecDevice:
         self.caps = 0
         self.driver = ""
         self.name = ""
+        # True when we kept the configuration the adapter already had. Worth
+        # knowing: adopting one leaves the DPCD tunneling bit alone, whereas
+        # claiming a new address resets the adapter and clears it.
+        self.adopted_existing = False
 
     # -- the one seam; tests replace this and nothing else
 
@@ -219,6 +228,19 @@ class CecDevice:
         if fcntl is None:
             raise CecError("ioctl is only available on Linux")
         return fcntl.ioctl(self.fd, request, payload)
+
+    def _call(self, request, payload, what):
+        """_ioctl with the errno turned into something a log line can carry.
+
+        Running under systemd, an unhandled OSError here becomes a Python
+        traceback in the journal, which says where the call was made but not
+        what it means. Every caller below goes through this instead.
+        """
+        try:
+            return self._ioctl(request, payload)
+        except OSError as exc:
+            raise CecError("%s failed: %s (errno %d)"
+                           % (what, exc.strerror, exc.errno or 0))
 
     # -- lifecycle
 
@@ -232,7 +254,8 @@ class CecDevice:
             # Follower mode as well as initiator: broadcasts such as
             # <Active Source> are addressed to everybody, and without it the
             # kernel would only hand us direct replies to our own frames.
-            self._ioctl(S_MODE, struct.pack("=I", MODE_INITIATOR | MODE_FOLLOWER))
+            self._call(S_MODE, struct.pack("=I", MODE_INITIATOR | MODE_FOLLOWER),
+                       "entering initiator+follower mode")
         except Exception:
             self.close()
             raise
@@ -267,7 +290,7 @@ class CecDevice:
 
     def _read_caps(self):
         buf = bytearray(CAPS_SIZE)
-        self._ioctl(ADAP_G_CAPS, buf)
+        self._call(ADAP_G_CAPS, buf, "reading adapter capabilities")
         driver, name, _avail, caps, _version = struct.unpack(CAPS_FMT, bytes(buf))
         self.driver = driver.split(b"\0")[0].decode("utf-8", "replace")
         self.name = name.split(b"\0")[0].decode("utf-8", "replace")
@@ -281,35 +304,72 @@ class CecDevice:
         cannot mistake it for a real address.
         """
         buf = bytearray(2)
-        self._ioctl(ADAP_G_PHYS_ADDR, buf)
+        self._call(ADAP_G_PHYS_ADDR, buf, "reading the physical address")
         (value,) = struct.unpack("=H", bytes(buf))
         self.physical_addr = None if value == PHYS_ADDR_INVALID else value
         return self.physical_addr
 
+    def log_addrs_info(self):
+        """The adapter's current logical-address configuration.
+
+        Returns a dict describing what is claimed right now. addr is None when
+        the adapter is unconfigured, and None with count > 0 while it is still
+        mid-claim - the kernel reports CEC_LOG_ADDR_INVALID in that window.
+        """
+        buf = bytearray(LOG_ADDRS_SIZE)
+        self._call(ADAP_G_LOG_ADDRS, buf, "reading logical addresses")
+        fields = struct.unpack(LOG_ADDRS_FMT, bytes(buf))
+        addr = fields[0][0]
+        return {
+            "addr": None if addr == LA_INVALID or addr > 15 else addr,
+            "count": fields[3],
+            "version": fields[2],
+            "osd_name": fields[6].split(b"\0")[0].decode("utf-8", "replace"),
+            "primary": fields[7][0],
+        }
+
     def read_log_addrs(self):
         """Our claimed logical address, or None while unconfigured."""
-        buf = bytearray(LOG_ADDRS_SIZE)
-        self._ioctl(ADAP_G_LOG_ADDRS, buf)
-        fields = struct.unpack(LOG_ADDRS_FMT, bytes(buf))
-        addrs, _mask, _version, count = fields[0], fields[1], fields[2], fields[3]
-        self.logical_addr = addrs[0] if count else None
+        self.logical_addr = self.log_addrs_info()["addr"]
         return self.logical_addr
 
     def configure(self, osd_name="SteamOS", device_type="playback",
-                  cec_version="1.4", vendor_id=None):
-        """Claim a logical address on the bus.
+                  cec_version="1.4", vendor_id=None, force=False):
+        """Make sure we hold a logical address on the bus.
 
-        This is the expensive operation in CEC - the adapter polls candidate
-        addresses to find a free one - so it is done once per run and never per
-        frame. It is also destructive on a DisplayPort adapter: see cec_dpcd,
-        whose tunneling bit this clears as a side effect. Anything that calls
-        this must re-enable tunneling afterwards, never before.
+        Claiming is the expensive operation in CEC - the adapter polls candidate
+        addresses to find a free one - and on a DisplayPort adapter it is also
+        destructive: it resets the adapter, which clears the DPCD tunneling bit
+        (see cec_dpcd). So this does as little as it can.
+
+        If the adapter is already configured the way we want it, that
+        configuration is adopted as-is and nothing is written. This is the
+        common case: the kernel's own drm_dp_cec driver claims an address when
+        it reads the EDID, long before we get here.
+
+        When a change really is needed, the addresses must be CLEARED first.
+        The kernel returns EBUSY for a CEC_ADAP_S_LOG_ADDRS on an adapter that
+        is already configured - going straight from configured to configured is
+        not allowed, and that is what this method used to try to do.
         """
         primary, addr_type, all_types = DEVICE_TYPES.get(
             device_type, DEVICE_TYPES["playback"])
         version = CEC_VERSIONS.get(str(cec_version), CEC_VERSION_1_4)
-
         name = osd_name.encode("utf-8", "replace")[:14]
+
+        current = self.log_addrs_info()
+        if not force and current["addr"] is not None:
+            matches = (current["primary"] == primary
+                       and current["version"] == version
+                       and current["osd_name"] == name.decode("utf-8", "replace"))
+            if matches:
+                self.logical_addr = current["addr"]
+                self.adopted_existing = True
+                return self.logical_addr
+
+        if current["count"]:
+            self.clear_log_addrs()
+
         payload = struct.pack(
             LOG_ADDRS_FMT,
             b"\xff\xff\xff\xff",                 # log_addr[4], kernel fills these in
@@ -324,23 +384,57 @@ class CecDevice:
             bytes([all_types, 0, 0, 0]),
             b"\0" * 48,                           # features
         )
-        buf = bytearray(payload)
-        self._ioctl(ADAP_S_LOG_ADDRS, buf)
+
+        # EBUSY here also covers "the adapter is configuring itself right now",
+        # which is a genuine transient - it happens when a hotplug or a resume
+        # has just kicked off an automatic re-claim. Give it a moment.
+        for attempt in range(S_LOG_ADDRS_RETRIES):
+            buf = bytearray(payload)
+            try:
+                self._ioctl(ADAP_S_LOG_ADDRS, buf)
+                break
+            except OSError as exc:
+                if exc.errno != errno.EBUSY or attempt == S_LOG_ADDRS_RETRIES - 1:
+                    raise CecError(
+                        "could not claim a logical address: %s (errno %d)"
+                        % (exc.strerror, exc.errno or 0))
+                time.sleep(S_LOG_ADDRS_RETRY_DELAY)
+                self.clear_log_addrs(ignore_errors=True)
 
         fields = struct.unpack(LOG_ADDRS_FMT, bytes(buf))
-        addrs, count = fields[0], fields[3]
-        self.logical_addr = addrs[0] if count else None
-        if self.logical_addr is None or self.logical_addr > 15:
+        addr = fields[0][0]
+        self.logical_addr = None if addr == LA_INVALID or addr > 15 else addr
+        self.adopted_existing = False
+
+        if self.logical_addr is None:
+            # The kernel accepted the request but is still polling for a free
+            # address; it settles within a second or so.
+            for _ in range(S_LOG_ADDRS_RETRIES):
+                time.sleep(S_LOG_ADDRS_RETRY_DELAY)
+                if self.read_log_addrs() is not None:
+                    break
+
+        if self.logical_addr is None:
             raise CecError("the adapter could not claim a logical address "
-                           "(nothing on the bus answered)")
+                           "(every candidate address is taken, or the bus is "
+                           "not responding)")
         return self.logical_addr
 
-    def clear_log_addrs(self):
-        """Release our logical address. Used only by the re-init escalation."""
+    def clear_log_addrs(self, ignore_errors=False):
+        """Release our logical address, unconfiguring the adapter.
+
+        Always permitted, unlike setting: this is the only route from a
+        configured adapter to a differently-configured one.
+        """
         payload = struct.pack(LOG_ADDRS_FMT, b"\xff\xff\xff\xff", 0,
                               CEC_VERSION_1_4, 0, 0xFFFFFF, 0, b"", b"\0" * 4,
                               b"\0" * 4, b"\0" * 4, b"\0" * 48)
-        self._ioctl(ADAP_S_LOG_ADDRS, bytearray(payload))
+        try:
+            self._ioctl(ADAP_S_LOG_ADDRS, bytearray(payload))
+        except OSError as exc:
+            if not ignore_errors:
+                raise CecError("could not release the logical address: %s"
+                               % exc.strerror)
         self.logical_addr = None
 
     # -- frames

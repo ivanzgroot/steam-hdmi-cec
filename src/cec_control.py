@@ -143,7 +143,10 @@ class Controller:
         )
         self.dpcd.ensure_enabled()
         self.device.read_phys_addr()
-        self.log("adapter ready: %s" % self.device.describe())
+        self.log("adapter ready: %s%s"
+                 % (self.device.describe(),
+                    " (kept the address it already held)"
+                    if self.device.adopted_existing else " (claimed)"))
 
         if self.device.physical_addr is None:
             raise CecError("the adapter has no physical address - the display "
