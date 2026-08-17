@@ -23,7 +23,7 @@ from cec_device import CecDevice, CecError                      # noqa: E402
 from cec_dpcd import DpcdTunneling                              # noqa: E402
 from cec_log import Logger                                      # noqa: E402
 
-VERSION = "3.0.0"
+VERSION = "1.0.0"
 DEFAULT_LOG = os.path.join(CEC_DIR, "cec-hook.log")
 
 

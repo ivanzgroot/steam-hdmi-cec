@@ -37,7 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cec_config import CEC_DIR, Config, DEFAULT_CONFIG          # noqa: E402
 from cec_log import Logger                                      # noqa: E402
 
-VERSION = "3.0.0"
+VERSION = "1.0.0"
 
 HOOK_SCRIPT = os.path.join(CEC_DIR, "cec-hook.py")
 DEFAULT_LOG = os.path.join(CEC_DIR, "cec-controller.log")
